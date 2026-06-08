@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# Testing / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Environments / secrets
+.env
+.env.*
+*.local
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data / model artifacts
+*.hdf5
+*.h5
+*.pkl
+*.ckpt
+*.pt
+*.pth
+*.npy
+*.npz
+*.bag
+*.mp4
+data/
+recordings/
+checkpoints/
+logs/
+wandb/
+outputs/
+
+# Agent tooling state (machine-local)
+.omc/
+.omx/
+
+temperature.sh
