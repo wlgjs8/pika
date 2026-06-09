@@ -349,7 +349,7 @@ def main():
             log.info("[gesture][%s] enter_closed=%.1f enter_open=%.1f dir=%+.0f window=%.1fs min_gap=%.0fms",
                      name, det.enter_closed, det.enter_open, det.dir, det.double_window, det.min_pinch_gap * 1e3)
         viewer = make_viewer(a.view, memory_limit=a.view_mem, img_every=a.view_img_every,
-                             session_dir=session_dir)
+                             session_dir=session_dir, arm_names=names)
     except Exception:
         if viewer is not None:
             viewer.close()

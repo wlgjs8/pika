@@ -131,6 +131,13 @@ _ARM_COLORS = {"right": [120, 120, 120], "left": [80, 160, 255]}
 _DEFAULT_COL = [120, 120, 120]
 
 
+def _ordered_arm_names(arm_names):
+    names = [name for name in (arm_names or []) if name]
+    ordered = [name for name in ("left", "right") if name in names]
+    ordered.extend(name for name in names if name not in ordered)
+    return ordered
+
+
 def make_viewer(mode="none", **kw):
     if mode in (None, "none"):
         return NullViewer()
@@ -157,15 +164,17 @@ class RerunViewer:
     enabled = True
 
     def __init__(self, mode="spawn", memory_limit="2GB", img_every=3, trail_len=600,
-                 session_dir=None):
+                 session_dir=None, arm_names=None):
         import rerun as rr  # 지연 import: 뷰어 켤 때만 로드
         self.rr = rr
         self.img_every = max(1, int(img_every))
         self.trail_len = trail_len
         self._trails = {}   # arm -> [pos,...]
         self._fc = {}       # arm -> frame counter(이미지 스로틀)
+        self.arm_names = _ordered_arm_names(arm_names)
 
         rr.init("pika_view")
+        self._send_default_blueprint()
         if mode == "web":
             lan_ips = _lan_ips()
             gport = _free_port(9876)
@@ -209,6 +218,63 @@ class RerunViewer:
             rr.spawn(port=gport, memory_limit=memory_limit)
             log.info("[viewer] 네이티브 창(spawn) :%d (mem<=%s)", gport, memory_limit)
         rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_UP, static=True)
+
+    def _send_default_blueprint(self):
+        """Start with color/color/world visible; keep diagnostics available but hidden."""
+        rr = self.rr
+        try:
+            import rerun.blueprint as rrb
+        except Exception as e:
+            log.warning("[viewer] 기본 blueprint 로드 실패: %s", e)
+            return
+
+        arms = self.arm_names or ["left", "right"]
+        color_views = [
+            rrb.Spatial2DView(
+                origin=f"/camera/{name}/d405_color",
+                name=f"{name}_color" if name in ("left", "right") else f"{name}_d405_color",
+            )
+            for name in arms[:2]
+        ]
+        while len(color_views) < 2:
+            missing_name = next(
+                (name for name in ("left", "right") if name not in arms),
+                f"arm{len(color_views)}",
+            )
+            color_views.append(
+                rrb.Spatial2DView(
+                    origin=f"/camera/{missing_name}/d405_color",
+                    name=f"{missing_name}_color",
+                    visible=False,
+                )
+            )
+
+        hidden_views = []
+        for name in arms:
+            hidden_views.append(
+                rrb.Spatial2DView(
+                    origin=f"/camera/{name}/d405_depth",
+                    name=f"{name}_depth",
+                    visible=False,
+                )
+            )
+        hidden_views.extend([
+            rrb.TimeSeriesView(origin="/plots", name="plots", visible=False),
+            rrb.TextDocumentView(origin="/status", name="status", visible=False),
+        ])
+
+        blueprint = rrb.Blueprint(
+            rrb.Horizontal(
+                *color_views,
+                rrb.Spatial3DView(origin="/world", name="world (pose)"),
+                *hidden_views,
+                column_shares=[1.0, 1.0, 1.0] + [0.0] * len(hidden_views),
+                name="pika live",
+            ),
+            auto_layout=False,
+            auto_views=False,
+        )
+        rr.send_blueprint(blueprint)
 
     # ---- 시계열/상태: per_arm = [(name, angle, closed), ...] ----
     def state(self, recording, ep, saved, rec_secs, per_arm):
