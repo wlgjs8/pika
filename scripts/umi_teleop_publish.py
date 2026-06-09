@@ -27,11 +27,13 @@ deadman(클러치)은 PikaAnyArm 트리거와 동일한 토글 의미:
 키: [space]=양팔 클러치 토글, [a]=좌팔, [l]=우팔, [q]=종료.
 """
 import argparse
+import glob
 import json
 import logging
 import math
 import os
 import socket
+import struct
 import sys
 import time
 
@@ -148,6 +150,80 @@ class KeyboardClutch:
             self._old = None
 
 
+# ----------------------------- USB 발판(FootSwitch) 클러치 (Linux evdev, stdin 무의존) -----------------------------
+class PedalClutch:
+    """USB FootSwitch(evdev)를 클러치로. 기본 momentary(밟는 동안 양팔 engage),
+    --pedal-toggle 시 밟을 때마다 토글. stdin을 안 읽으므로 원격/비-tty 실행에 안전.
+
+    PCsensor FootSwitch는 키보드형 키 이벤트(KEY_PRESS value=1 / KEY_RELEASE value=0)를
+    보낸다. momentary는 마지막 키 상태(눌림=1)를 engage로, toggle은 누름 edge마다 뒤집는다.
+    `key/code` 필터 없이 EV_KEY 이벤트를 그대로 사용(발판이 어떤 키를 보내든 동작).
+    """
+    EV_KEY = 0x01
+    EVENT = struct.Struct("llHHi")  # input_event: timeval(2 long) + type + code + value
+
+    def __init__(self, device="auto", toggle=False):
+        self.device_arg = device
+        self.toggle = bool(toggle)
+        self.fd = None
+        self.path = None
+        self.held = False        # momentary: 발판 눌림 상태
+        self.engaged_both = False  # toggle: 누적 상태
+        self.quit = False        # 인터페이스 호환(발판엔 종료 키 없음)
+
+    def _resolve_device(self):
+        if self.device_arg not in ("auto", ""):
+            return self.device_arg
+        cands = sorted(glob.glob("/dev/input/by-id/*FootSwitch*event-kbd")) or \
+            sorted(glob.glob("/dev/input/by-id/*[Ff]oot[Ss]witch*event-kbd"))
+        return cands[0] if cands else None
+
+    def start(self):
+        path = self._resolve_device()
+        if not path:
+            raise RuntimeError("FootSwitch evdev 장치를 찾지 못함 (/dev/input/by-id/*FootSwitch*event-kbd). "
+                               "--pedal-device 로 직접 지정하거나 권한(input 그룹) 확인.")
+        try:
+            self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except PermissionError as e:
+            raise RuntimeError(f"{path} 읽기 권한 없음 ({e}). 'sudo usermod -aG input $USER' 후 재로그인 또는 udev 규칙 필요.")
+        self.path = path
+        return self
+
+    def update(self):
+        # 쌓인 이벤트를 모두 소비해 상태 갱신
+        while True:
+            try:
+                data = os.read(self.fd, self.EVENT.size * 64)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            if not data:
+                break
+            usable = len(data) - (len(data) % self.EVENT.size)
+            for off in range(0, usable, self.EVENT.size):
+                _, _, etype, _code, value = self.EVENT.unpack_from(data, off)
+                if etype != self.EV_KEY:
+                    continue
+                if value == 1:      # 누름
+                    self.held = True
+                    if self.toggle:
+                        self.engaged_both = not self.engaged_both
+                elif value == 0:    # 뗌
+                    self.held = False
+        on = self.engaged_both if self.toggle else self.held
+        return {"left": on, "right": on}
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+
 # ----------------------------- arms.json 로더 (collect.build_arms 의 최소 버전) -----------------------------
 def load_arms(config_path):
     """config/arms.json → ArmSpec 리스트(좌/우). pika_win.recorder.ArmSpec 사용."""
@@ -214,6 +290,14 @@ def get_arguments():
     ap.add_argument("--left-key", default="a")
     ap.add_argument("--right-key", default="l")
     ap.add_argument("--both-key", default=" ")
+    ap.add_argument("--swap-lr", action="store_true",
+                    help="좌/우 트래커↔로봇팔 매핑을 스왑(로봇을 마주보고 조작할 때 미러)")
+    ap.add_argument("--pedal", action="store_true",
+                    help="USB 발판(FootSwitch)을 클러치로 사용(키보드 대신, stdin 무의존)")
+    ap.add_argument("--pedal-device", default="auto",
+                    help="발판 evdev 경로(기본 auto=/dev/input/by-id/*FootSwitch*event-kbd)")
+    ap.add_argument("--pedal-toggle", action="store_true",
+                    help="발판을 밟을 때마다 토글(기본은 밟는 동안만 engage하는 momentary)")
     ap.add_argument("--start-engaged", action="store_true",
                     help="시작 시 양팔 클러치 ON (키 입력 없이 즉시 추종)")
     ap.add_argument("--verbose", action="store_true")
@@ -242,11 +326,16 @@ def main():
     targets = [(a.target_host, a.left_port), (a.target_host, a.right_port)]
     log.info("[umi] 송신 대상: %s (좌/우 동일 패킷)", targets)
 
-    clutch = KeyboardClutch(a.left_key, a.right_key, a.both_key).start()
-    if a.start_engaged:
-        clutch.engaged = {"left": True, "right": True}
-    log.info("[umi] 키: [%s]=양팔 [%s]=좌 [%s]=우 [q]=종료",
-             a.both_key if a.both_key.strip() else "space", a.left_key, a.right_key)
+    if a.pedal:
+        clutch = PedalClutch(a.pedal_device, toggle=a.pedal_toggle).start()
+        mode = "토글(밟을 때마다)" if a.pedal_toggle else "momentary(밟는 동안)"
+        log.info("[umi] 발판 클러치: %s  device=%s  (%s)", "ON", clutch.path, mode)
+    else:
+        clutch = KeyboardClutch(a.left_key, a.right_key, a.both_key).start()
+        if a.start_engaged:
+            clutch.engaged = {"left": True, "right": True}
+        log.info("[umi] 키: [%s]=양팔 [%s]=좌 [%s]=우 [q]=종료",
+                 a.both_key if a.both_key.strip() else "space", a.left_key, a.right_key)
 
     # 그리퍼 자동 범위(open/closed 미지정 시 관측 min/max 누적)
     grange = {n: [a.grip_open, a.grip_closed] for n in SIDES}
@@ -273,7 +362,8 @@ def main():
                         grip_angle if hi is None else max(hi, grip_angle),
                     ]
                 gn = normalize_gripper(grip_angle, grange[name][0], grange[name][1])
-                sides[name] = {"pose": pose, "gripper": gn, "deadman": engaged.get(name, False)}
+                out_name = {"left": "right", "right": "left"}[name] if a.swap_lr else name
+                sides[out_name] = {"pose": pose, "gripper": gn, "deadman": engaged.get(name, False)}
 
             packet = build_packet(time.monotonic(), sides)
             data = json.dumps(packet).encode("utf-8")
