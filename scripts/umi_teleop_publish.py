@@ -40,6 +40,8 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
+from pika_win.sdk_logging import quiet_pika_sdk_info  # noqa: E402
+
 log = logging.getLogger("pika.umi_teleop")
 
 SIDES = ("left", "right")
@@ -419,6 +421,8 @@ def get_arguments():
                     help="그리퍼 POSITION_CTRL 최대 송신 Hz")
     ap.add_argument("--gripper-engaged-only", action="store_true",
                     help="클러치 engage 동안만 그리퍼 추종(기본은 항상 추종)")
+    ap.add_argument("--show-sdk-parse-errors", action="store_true",
+                    help="Pika SDK 시리얼 JSON 파싱 오류를 스로틀된 경고로 표시")
     ap.add_argument("--verbose", action="store_true")
     args, _ = ap.parse_known_args()
     return args
@@ -431,6 +435,7 @@ def main():
         return
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(message)s")
+    quiet_pika_sdk_info(show_parse_errors=a.show_sdk_parse_errors)
     from pika_win.recorder import EpisodeRecorder  # openvr 의존 — main 안에서 지연 임포트
 
     arms = load_arms(a.config)
