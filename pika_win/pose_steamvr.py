@@ -6,8 +6,13 @@
 포즈 포맷도 PIKA PoseData와 동일:
   - position [x, y, z] (m), rotation [x, y, z, w] (쿼터니언)
 옵션:
-  - apply_gripper_offset=True 시 트래커 로컬 프레임의 그리퍼 오프셋([0.172,0,-0.076]m) 적용
-    (PIKA가 적용하는 물리 오프셋. 전역 축 정렬은 별도 캘리브레이션에서 처리)
+  - apply_gripper_offset=True 시 PIKA SDK 공식 트래커→그리퍼 팁 변환을 적용해
+    포즈 원점을 그리퍼 핑거팁 라인(축: x=전방/접근, y=좌, z=상)으로 옮긴다:
+      T_pub = T_tracker(raw) · R_corr · Trans(0.172, 0, -0.076)
+      R_corr = Rx(-20°) · [Ry(-90°) · Rx(-90°)]   (pika_sdk vive_tracker.py 하드코딩과 동일)
+    주의: R_corr 는 libsurvive raw frame 기준 정의다. 본 리더는 OpenVR 경로이므로
+    두 body frame 동일성은 캘리브레이션 클립으로 확정 전까지 가정이다
+    (기대값: raw frame 레버암 [0,-0.0126,+0.1876]m ≈18.8cm, 접근축 = 트래커 +z에서 20°).
 """
 import math
 import threading
@@ -15,8 +20,56 @@ import time
 
 import openvr
 
-# PIKA: 트래커 원점 -> 그리퍼 중심 (트래커 로컬 프레임, meter)
-GRIPPER_OFFSET = (0.172, 0.0, -0.076)
+# PIKA SDK 공식: 트래커 원점 -> 그리퍼 팁 (보정 후 그리퍼 frame 기준 병진, meter)
+# (구 GRIPPER_OFFSET 동일 수치 — 단, raw 트래커 frame이 아니라 R_corr 적용 후 frame에서의 값)
+TIP_TRANSLATION = (0.172, 0.0, -0.076)
+
+
+def _rpy_to_quat(roll, pitch, yaw):
+    """R = Rz(yaw)·Ry(pitch)·Rx(roll) 의 쿼터니언 (x,y,z,w) — pika_sdk xyzrpy2Mat 규약."""
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
+
+
+def quat_mul(a, b):
+    """쿼터니언 곱 a⊗b ((x,y,z,w), 회전 합성: b를 a의 로컬 frame에서 추가 적용)."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+# R_corr = Rx(-20°)·[Ry(-90°)·Rx(-90°)] — pika_sdk 와 동일하게 합성
+_DEG = math.pi / 180.0
+TIP_ROTATION_QUAT = quat_mul(
+    _rpy_to_quat(-20.0 * _DEG, 0.0, 0.0),
+    _rpy_to_quat(-90.0 * _DEG, -90.0 * _DEG, 0.0),
+)
+
+
+def apply_tip_transform(pos, quat):
+    """raw 트래커 포즈 → 공식 그리퍼 팁 포즈. T_pub = T_raw · R_corr · Trans(TIP_TRANSLATION).
+
+    병진은 R_corr 적용 후 frame에서 정의되므로 raw frame 레버암은
+    R_corr·t (= quat_rotate_vec(TIP_ROTATION_QUAT, TIP_TRANSLATION) ≈ [0,-0.0126,+0.1876]).
+    """
+    lever_local = quat_rotate_vec(TIP_ROTATION_QUAT, TIP_TRANSLATION)
+    off = quat_rotate_vec(quat, lever_local)
+    return (
+        (pos[0] + off[0], pos[1] + off[1], pos[2] + off[2]),
+        quat_mul(quat, TIP_ROTATION_QUAT),
+    )
 
 
 def mat34_to_pos_quat(m):
@@ -59,13 +112,11 @@ class PoseSteamVR:
     def __init__(self, target_hz=250.0,
                  origin=openvr.TrackingUniverseStanding,
                  device_class=openvr.TrackedDeviceClass_GenericTracker,
-                 apply_gripper_offset=False,
-                 gripper_offset=GRIPPER_OFFSET):
+                 apply_gripper_offset=False):
         self.target_hz = float(target_hz)
         self.origin = origin
         self.device_class = device_class
         self.apply_gripper_offset = apply_gripper_offset
-        self.gripper_offset = gripper_offset
         self.vr = None
         self._latest = {}            # serial -> pose dict
         self._lock = threading.Lock()
@@ -97,8 +148,7 @@ class PoseSteamVR:
                     continue
                 pos, quat = mat34_to_pos_quat(p.mDeviceToAbsoluteTracking)
                 if self.apply_gripper_offset:
-                    off = quat_rotate_vec(quat, self.gripper_offset)
-                    pos = (pos[0] + off[0], pos[1] + off[1], pos[2] + off[2])
+                    pos, quat = apply_tip_transform(pos, quat)
                 try:
                     sn = self.vr.getStringTrackedDeviceProperty(i, openvr.Prop_SerialNumber_String)
                 except Exception:

@@ -12,6 +12,11 @@ robotics_lab policy_runner 의 `umi_dual_cartesian` 액션소스(UdpUmiPoseReade
    "right": {"pose": [...],               "gripper": <0..1>, "deadman": <bool>}}
 - pose 프레임 = steamvr_world (TrackingUniverseStanding). 상대 모션만 쓰이므로
   월드 정렬/측정 캘리브레이션 불필요 (teleop은 무캘리브레이션).
+- pose 원점(기본 --pose-frame tip) = PIKA SDK 공식 변환을 적용한 그리퍼 핑거팁 라인
+  (T_raw·R_corr·Trans(0.172,0,-0.076), 축 x=전방/y=좌/z=상). relative-init 텔레옵의
+  회전 피벗 = 발행 원점이므로, 로봇 URDF TCP(그리퍼 팁)와 일치해야 직관적 조작이 된다.
+  --pose-frame tracker 로 구(raw 트래커 원점) 동작 복귀 가능 — 이때는 robotics_lab
+  수신측 r_align/gripper_offset config 도 함께 되돌려야 한다.
 - 수신부는 side(left/right) 마다 별도 포트에 bind 하므로, 같은 결합 패킷을
   좌/우 두 목적지 포트로 각각 보낸다 (각 리더가 자기 side만 추출).
 - pose 가 유효하지 않은(미검출) side 는 패킷에서 생략 → 해당 팔은 Hold.
@@ -377,7 +382,29 @@ def selftest():
     assert gripper_send_decision(0.5, (0.0, 0.5), 1.0, 0.0, 1.75, 0.005, 1 / 60) is None      # 데드밴드
     assert gripper_send_decision(0.6, (0.99, 0.5), 1.0, 0.0, 1.75, 0.005, 1 / 60) is None     # 레이트리밋
     assert gripper_send_decision(0.6, (0.0, 0.5), 1.0, 0.0, 1.75, 0.005, 1 / 60) == 0.6       # 통과
-    print("selftest OK")
+    # 트래커→그리퍼 팁 공식 변환 (openvr 모듈 임포트만 필요 — SteamVR 불필요)
+    try:
+        from pika_win.pose_steamvr import (
+            TIP_ROTATION_QUAT, TIP_TRANSLATION, apply_tip_transform, quat_rotate_vec)
+    except ImportError as exc:
+        print(f"selftest OK (tip-transform 검증 생략: {exc})")
+        return
+    # raw 항등 포즈 → 원점은 raw frame 레버암 R_corr·t = [0, -0.0126, +0.1876] 로 이동
+    pos, quat = apply_tip_transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    expect = quat_rotate_vec(TIP_ROTATION_QUAT, TIP_TRANSLATION)
+    assert all(abs(p - e) < 1e-12 for p, e in zip(pos, expect)), (pos, expect)
+    assert abs(pos[0]) < 1e-9 and abs(pos[1] + 0.0126) < 1e-3 and abs(pos[2] - 0.1876) < 1e-3, pos
+    assert abs(sum(c * c for c in quat) - 1.0) < 1e-9
+    # 접근축(팁 frame x)은 raw 트래커 +z에서 정확히 20°
+    approach_raw = quat_rotate_vec(quat, (1.0, 0.0, 0.0))
+    angle = math.degrees(math.acos(max(-1.0, min(1.0, approach_raw[2]))))
+    assert abs(angle - 20.0) < 1e-6, angle
+    # 병진은 raw 포즈 회전을 따라간다 (z축 90° 회전 시 레버암도 90° 회전)
+    s = math.sin(math.pi / 4)
+    pos_rot, _ = apply_tip_transform((1.0, 2.0, 3.0), (0.0, 0.0, s, s))
+    lever = quat_rotate_vec((0.0, 0.0, s, s), expect)
+    assert all(abs(p - (b + l)) < 1e-9 for p, b, l in zip(pos_rot, (1.0, 2.0, 3.0), lever))
+    print("selftest OK (tip-transform 포함)")
 
 
 def get_arguments():
@@ -398,6 +425,9 @@ def get_arguments():
     ap.add_argument("--both-key", default=" ")
     ap.add_argument("--swap-lr", action="store_true",
                     help="좌/우 트래커↔로봇팔 매핑을 스왑(로봇을 마주보고 조작할 때 미러)")
+    ap.add_argument("--pose-frame", choices=("tip", "tracker"), default="tip",
+                    help="발행 포즈 원점: tip=PIKA 공식 그리퍼 팁 변환 적용(기본, "
+                         "URDF 팁 TCP와 짝), tracker=raw 트래커 원점(구 동작)")
     ap.add_argument("--pedal", action="store_true",
                     help="USB 발판(FootSwitch)을 클러치로 사용(키보드 대신, stdin 무의존)")
     ap.add_argument("--pedal-device", default="auto",
@@ -441,10 +471,12 @@ def main():
     arms = load_arms(a.config)
     rec = EpisodeRecorder(out_dir=os.path.join(REPO_ROOT, "data", "_umi_teleop_tmp"),
                           arms=arms, use_realsense=False, use_sense=not a.no_sense,
-                          use_pose=True, require_pose=True)
+                          use_pose=True, require_pose=True,
+                          pose_tip_frame=(a.pose_frame == "tip"))
     rec.start()
     names = rec.arm_names()
-    log.info("[umi] 활성 팔: %s", names)
+    log.info("[umi] 활성 팔: %s  pose_frame=%s", names,
+             "gripper_tip(공식 변환)" if a.pose_frame == "tip" else "tracker_raw")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     targets = [(a.target_host, a.left_port), (a.target_host, a.right_port)]

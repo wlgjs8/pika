@@ -4,8 +4,9 @@
 umi_teleop_publish.py 가 UDP 로 '송신'하는 것과 달리, 이 스크립트는 로봇/네트워크
 없이 PoseSteamVR 폴러(기본 target 250Hz)의 스냅샷을 '새 샘플일 때만' CSV 한 줄로
 남긴다. 발행 rate 로 리샘플하지 않으므로 기록 Hz = 폴러가 실제로 달성한 고유 Hz.
-포즈는 raw(steamvr_world, 그리퍼 오프셋 미적용)가 기본 — --gripper-offset 시
-PIKA 물리 오프셋([0.172,0,-0.076]m, 트래커 로컬)을 적용해 기록.
+포즈는 raw(steamvr_world, 트래커 원점)가 기본 — --gripper-offset 시 PIKA SDK 공식
+트래커→그리퍼 팁 변환(R_corr·Trans(0.172,0,-0.076), pose_steamvr.apply_tip_transform)을
+적용해 기록.
 
 트리거(--trigger):
   start  = 발판 첫 밟음부터 종료(Ctrl-C)까지 계속 기록 (기본)
@@ -163,7 +164,7 @@ def get_arguments():
                     help="발판 evdev 경로(기본 auto=/dev/input/by-id/*FootSwitch*event-kbd)")
     ap.add_argument("--no-pedal", action="store_true", help="발판 없이 시작 즉시 기록(테스트용)")
     ap.add_argument("--gripper-offset", action="store_true",
-                    help="PIKA 그리퍼 오프셋([0.172,0,-0.076]m, 트래커 로컬) 적용해 기록(기본 raw)")
+                    help="PIKA 공식 트래커→그리퍼 팁 변환(R_corr·Trans) 적용해 기록(기본 raw)")
     ap.add_argument("--flush-sec", type=float, default=0.5, help="CSV flush 주기")
     ap.add_argument("--verbose", action="store_true")
     args, _ = ap.parse_known_args()

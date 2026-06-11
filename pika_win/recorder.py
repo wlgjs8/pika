@@ -57,7 +57,7 @@ class EpisodeRecorder:
     def __init__(self, out_dir, arms=None, record_hz=30, jpeg_quality=90,
                  use_pose=True, use_sense=True, use_realsense=True,
                  settle=1.0, require_pose=False, require_all_trackers=False,
-                 pose_valid_timeout=2.0,
+                 pose_valid_timeout=2.0, pose_tip_frame=False,
                  # ---- 레거시 단일-팔 호환 kwargs (arms 미지정 시 사용) ----
                  com_port="COM3", realsense_sn=None):
         self.out_dir = out_dir
@@ -72,6 +72,9 @@ class EpisodeRecorder:
         self.require_pose = bool(require_pose)
         self.require_all_trackers = bool(require_all_trackers)
         self.pose_valid_timeout = float(pose_valid_timeout)
+        # True 시 PIKA SDK 공식 트래커→그리퍼 팁 변환을 적용해 발행/기록
+        # (pose_steamvr.apply_tip_transform 참조)
+        self.pose_tip_frame = bool(pose_tip_frame)
         self.pose = None
         self.active = []   # list[_ArmIO] — 실제 활성 팔(1 또는 2)
 
@@ -80,8 +83,10 @@ class EpisodeRecorder:
         # 1) 포즈(SteamVR) 1개만 연결 — 모든 트래커가 공유
         if self.flags["pose"]:
             try:
-                self.pose = PoseSteamVR(target_hz=250).connect()
-                log.info("[pose] SteamVR 연결")
+                self.pose = PoseSteamVR(
+                    target_hz=250, apply_gripper_offset=self.pose_tip_frame).connect()
+                log.info("[pose] SteamVR 연결 (frame=%s)",
+                         "gripper_tip" if self.pose_tip_frame else "tracker_raw")
             except Exception as e:
                 log.error("[pose] SteamVR/OpenVR 연결 실패: %s", e)
                 self.pose = None
@@ -303,7 +308,9 @@ class EpisodeRecorder:
         with h5py.File(path, "w") as h:
             h.attrs["record_hz"] = self.record_hz
             h.attrs["effective_hz"] = eff
-            h.attrs["pose_frame"] = "steamvr_world"
+            # tip frame: 동일 world 에서 포즈 원점만 트래커→그리퍼 팁(공식 변환)으로 이동
+            h.attrs["pose_frame"] = (
+                "steamvr_world_gripper_tip" if self.pose_tip_frame else "steamvr_world")
             h.attrs["pose_format"] = "x,y,z,qx,qy,qz,qw"
             h.attrs["n_arms"] = n
             h.attrs["arm_names"] = ",".join(names)
