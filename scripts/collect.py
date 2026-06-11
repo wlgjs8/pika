@@ -14,6 +14,7 @@
 종료: Ctrl-C (녹화 중이면 마지막 에피소드 저장)
 """
 import argparse
+import atexit
 import glob
 import logging
 import os
@@ -32,6 +33,79 @@ from pika_win.viewer import make_viewer  # noqa: E402
 log = logging.getLogger("collect")
 
 MAX_ARMS = 2  # Vive 양팔
+
+
+class CollectRunLock:
+    """collect.py 동시 실행 방지용 PID 락."""
+    def __init__(self, path):
+        self.path = path
+        self.fd = None
+
+    def acquire(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        while True:
+            try:
+                self.fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                break
+            except FileExistsError:
+                pid, cmd = self._read_existing()
+                if pid and self._pid_alive(pid):
+                    detail = f"pid={pid}"
+                    if cmd:
+                        detail += f" cmd={cmd}"
+                    raise RuntimeError(
+                        f"[lock] collect.py가 이미 실행 중입니다 ({detail}). "
+                        "기존 수집을 종료한 뒤 다시 실행하세요."
+                    )
+                try:
+                    os.unlink(self.path)
+                except FileNotFoundError:
+                    pass
+        body = f"pid={os.getpid()}\ncmd={' '.join(sys.argv)}\n"
+        os.write(self.fd, body.encode("utf-8", errors="replace"))
+        atexit.register(self.release)
+        return self
+
+    def release(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+
+    def _read_existing(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return None, ""
+        values = {}
+        for line in lines:
+            if "=" in line:
+                k, v = line.split("=", 1)
+                values[k.strip()] = v.strip()
+        try:
+            pid = int(values.get("pid", ""))
+        except ValueError:
+            pid = None
+        return pid, values.get("cmd", "")
+
+    @staticmethod
+    def _pid_alive(pid):
+        if pid == os.getpid():
+            return True
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
 
 
 def _split(s):
@@ -318,6 +392,13 @@ def main():
     )
     quiet_pika_sdk_info()
 
+    lock_path = os.path.join(a.out, ".collect.lock")
+    try:
+        run_lock = CollectRunLock(lock_path).acquire()
+    except RuntimeError as e:
+        log.error("%s", e)
+        sys.exit(2)
+
     # 이 실행(세션) 전용 출력 폴더: data/data_YYYYMMDD_HHMMSS (시작 시각, 초 단위)
     session_dir = os.path.join(a.out, "data_" + time.strftime("%Y%m%d_%H%M%S"))
     os.makedirs(session_dir, exist_ok=True)
@@ -501,6 +582,7 @@ def main():
         keyboard.close()
         viewer.close()
         rec.stop()
+        run_lock.release()
 
 
 if __name__ == "__main__":

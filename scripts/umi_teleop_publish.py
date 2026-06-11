@@ -224,6 +224,101 @@ class PedalClutch:
             self.fd = None
 
 
+# ----------------------------- 로봇측 Pika Gripper 추종 (POSITION_CTRL) -----------------------------
+def gripper_send_decision(rad, last, now, min_rad, max_rad, deadband_rad, min_period):
+    """보낼 모터각(rad) 결정 — 클램프 + 데드밴드 + 레이트리밋. (순수함수, selftest 가능)
+
+    rad: Sense 인코더 각도(rad, None/NaN=미정), last: (last_monotonic, last_rad)|None.
+    반환: 송신할 rad 또는 None(스킵).
+    """
+    if rad is None or (isinstance(rad, float) and math.isnan(rad)):
+        return None
+    clamped = max(float(min_rad), min(float(max_rad), float(rad)))
+    if last is not None:
+        last_t, last_rad = last
+        if now - last_t < min_period:
+            return None
+        if abs(clamped - last_rad) < deadband_rad:
+            return None
+    return clamped
+
+
+class _LogThrottle(logging.Filter):
+    """같은 로거의 메시지를 period당 1건으로 제한 (pika SDK telemetry 파싱 에러 스팸 방지)."""
+
+    def __init__(self, period_sec=2.0):
+        super().__init__()
+        self.period_sec = period_sec
+        self._last = 0.0
+
+    def filter(self, record):
+        now = time.monotonic()
+        if now - self._last >= self.period_sec:
+            self._last = now
+            return True
+        return False
+
+
+class GripperFollower:
+    """Sense 인코더 각도(rad)를 로봇에 장착된 Pika Gripper 모터각으로 추종.
+
+    매뉴얼상 Sense/Gripper 파라미터 동일 → 기본 1:1 rad 패스스루(범위 클램프만).
+    ports 의 side 키는 '로봇팔 기준'(= 패킷 out_name, --swap-lr 적용 후)이다.
+    시리얼 오류는 teleop 본체를 죽이지 않고 스로틀 WARN으로만 보고한다.
+    """
+
+    def __init__(self, ports, min_rad=0.0, max_rad=1.75, deadband_rad=0.005, max_hz=60.0):
+        self.ports = dict(ports)            # {"left": "/dev/...", "right": "/dev/..."}
+        self.min_rad = float(min_rad)
+        self.max_rad = float(max_rad)
+        self.deadband_rad = float(deadband_rad)
+        self.min_period = 1.0 / max_hz if max_hz > 0 else 0.0
+        self.grippers = {}
+        self._last_sent = {}                # side -> (monotonic, rad)
+        self._warned = {}                   # side -> last warn monotonic
+
+    def start(self):
+        from pika.gripper import Gripper    # pika SDK — 지연 임포트
+        # 24V 미인가 등으로 telemetry 가 깨질 때 SDK 가 에러를 틱마다 찍음 → 스로틀
+        logging.getLogger("pika.serial_comm").addFilter(_LogThrottle(2.0))
+        for side, port in self.ports.items():
+            g = Gripper(port=port)
+            if not g.connect():
+                raise RuntimeError(f"[gripper:{side}] {port} 연결 실패")
+            if not g.enable():
+                raise RuntimeError(f"[gripper:{side}] {port} enable 실패")
+            self.grippers[side] = g
+            log.info("[gripper] %s ← %s 연결+enable", side, port)
+        return self
+
+    def update(self, side, rad):
+        g = self.grippers.get(side)
+        if g is None:
+            return
+        now = time.monotonic()
+        decided = gripper_send_decision(
+            rad, self._last_sent.get(side), now,
+            self.min_rad, self.max_rad, self.deadband_rad, self.min_period)
+        if decided is None:
+            return
+        try:
+            g.set_motor_angle(decided)
+            self._last_sent[side] = (now, decided)
+        except Exception as exc:
+            if now - self._warned.get(side, 0.0) > 2.0:
+                self._warned[side] = now
+                log.warning("[gripper:%s] 송신 실패: %s", side, exc)
+
+    def close(self):
+        for side, g in self.grippers.items():
+            for fn in (g.disable, g.disconnect):
+                try:
+                    fn()
+                except Exception:
+                    pass
+        self.grippers = {}
+
+
 # ----------------------------- arms.json 로더 (collect.build_arms 의 최소 버전) -----------------------------
 def load_arms(config_path):
     """config/arms.json → ArmSpec 리스트(좌/우). pika_win.recorder.ArmSpec 사용."""
@@ -271,6 +366,15 @@ def selftest():
     assert normalize_gripper(-5, 0, 10) == 0.0
     assert normalize_gripper(None, 0, 10) is None
     assert normalize_gripper(5, 0, 0) is None  # 범위 미확정
+    # 그리퍼 추종 판단: 클램프/데드밴드/레이트리밋/무효입력
+    assert gripper_send_decision(None, None, 0.0, 0.0, 1.75, 0.005, 1 / 60) is None
+    assert gripper_send_decision(float("nan"), None, 0.0, 0.0, 1.75, 0.005, 1 / 60) is None
+    assert gripper_send_decision(0.5, None, 0.0, 0.0, 1.75, 0.005, 1 / 60) == 0.5
+    assert gripper_send_decision(9.0, None, 0.0, 0.0, 1.75, 0.005, 1 / 60) == 1.75   # 상한 클램프
+    assert gripper_send_decision(-1.0, None, 0.0, 0.0, 1.75, 0.005, 1 / 60) == 0.0   # 하한 클램프
+    assert gripper_send_decision(0.5, (0.0, 0.5), 1.0, 0.0, 1.75, 0.005, 1 / 60) is None      # 데드밴드
+    assert gripper_send_decision(0.6, (0.99, 0.5), 1.0, 0.0, 1.75, 0.005, 1 / 60) is None     # 레이트리밋
+    assert gripper_send_decision(0.6, (0.0, 0.5), 1.0, 0.0, 1.75, 0.005, 1 / 60) == 0.6       # 통과
     print("selftest OK")
 
 
@@ -300,6 +404,21 @@ def get_arguments():
                     help="발판을 밟을 때마다 토글(기본은 밟는 동안만 engage하는 momentary)")
     ap.add_argument("--start-engaged", action="store_true",
                     help="시작 시 양팔 클러치 ON (키 입력 없이 즉시 추종)")
+    ap.add_argument("--left-gripper-port", default="/dev/ttyUSB2",
+                    help="로봇 왼팔에 장착된 Pika Gripper 시리얼 포트(지정 시 추종 활성). "
+                         "side 는 로봇팔 기준(= --swap-lr 적용 후 out_name)")
+    ap.add_argument("--right-gripper-port", default="/dev/ttyUSB3",
+                    help="로봇 오른팔에 장착된 Pika Gripper 시리얼 포트")
+    ap.add_argument("--gripper-min-rad", type=float, default=0.0,
+                    help="그리퍼 모터각 하한(rad)")
+    ap.add_argument("--gripper-max-rad", type=float, default=1.75,
+                    help="그리퍼 모터각 상한(rad) — Sense open 실측 ~1.71rad 기준 여유")
+    ap.add_argument("--gripper-deadband-rad", type=float, default=0.005,
+                    help="이 변화량 미만이면 재송신 생략")
+    ap.add_argument("--gripper-rate", type=float, default=60.0,
+                    help="그리퍼 POSITION_CTRL 최대 송신 Hz")
+    ap.add_argument("--gripper-engaged-only", action="store_true",
+                    help="클러치 engage 동안만 그리퍼 추종(기본은 항상 추종)")
     ap.add_argument("--verbose", action="store_true")
     args, _ = ap.parse_known_args()
     return args
@@ -337,6 +456,22 @@ def main():
         log.info("[umi] 키: [%s]=양팔 [%s]=좌 [%s]=우 [q]=종료",
                  a.both_key if a.both_key.strip() else "space", a.left_key, a.right_key)
 
+    # 로봇측 Pika Gripper 추종 (옵션) — side 키는 로봇팔 기준(out_name)
+    gripper_ports = {}
+    if a.left_gripper_port:
+        gripper_ports["left"] = a.left_gripper_port
+    if a.right_gripper_port:
+        gripper_ports["right"] = a.right_gripper_port
+    
+    gripper_follow = None
+    if gripper_ports:
+        gripper_follow = GripperFollower(
+            gripper_ports, a.gripper_min_rad, a.gripper_max_rad,
+            a.gripper_deadband_rad, a.gripper_rate).start()
+        log.info("[gripper] 추종 활성: %s (%s, max %.0fHz, 데드밴드 %.3frad)",
+                 gripper_ports, "engage 시에만" if a.gripper_engaged_only else "항상",
+                 a.gripper_rate, a.gripper_deadband_rad)
+        
     # 그리퍼 자동 범위(open/closed 미지정 시 관측 min/max 누적)
     grange = {n: [a.grip_open, a.grip_closed] for n in SIDES}
     period = 1.0 / a.rate if a.rate > 0 else 0.0
@@ -364,6 +499,12 @@ def main():
                 gn = normalize_gripper(grip_angle, grange[name][0], grange[name][1])
                 out_name = {"left": "right", "right": "left"}[name] if a.swap_lr else name
                 sides[out_name] = {"pose": pose, "gripper": gn, "deadman": engaged.get(name, False)}
+                # 로봇측 그리퍼 추종: Sense 인코더 rad → 같은 로봇팔(out_name)의 Gripper 모터각
+                if gripper_follow is not None and (
+                        not a.gripper_engaged_only or engaged.get(name, False)):
+                    grip_rad = (math.radians(grip_angle)
+                                if isinstance(grip_angle, (int, float)) else None)
+                    gripper_follow.update(out_name, grip_rad)
 
             packet = build_packet(time.monotonic(), sides)
             data = json.dumps(packet).encode("utf-8")
@@ -384,6 +525,8 @@ def main():
         pass
     finally:
         clutch.close()
+        if gripper_follow is not None:
+            gripper_follow.close()
         sock.close()
         rec.stop()
         log.info("[umi] 종료")
