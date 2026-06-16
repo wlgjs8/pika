@@ -39,6 +39,7 @@ deadman(클러치)은 PikaAnyArm 트리거와 동일한 토글 의미:
 키: [space]=양팔 클러치 토글, [a]=좌팔, [l]=우팔, [q]=종료.
 """
 import argparse
+import datetime
 import glob
 import json
 import logging
@@ -57,6 +58,59 @@ from pika_win.sdk_logging import quiet_pika_sdk_info  # noqa: E402
 log = logging.getLogger("pika.umi_teleop")
 
 SIDES = ("left", "right")
+
+# 한국 표준시(KST, UTC+9) — 서버 시스템 TZ 와 무관하게 항상 KST 로 타임스탬프
+KST = datetime.timezone(datetime.timedelta(hours=9), name="KST")
+# 송신 간격이 이 값을 넘으면 로그 라인에 [GAP] 토큰을 붙여 grep 으로 찾기 쉽게 한다(ms)
+GAP_THRESHOLD_MS = 50.0
+
+
+def _kst_now():
+    return datetime.datetime.now(KST)
+
+
+class PacketLogger:
+    """매 UDP 송신을 KST 기준으로 한 줄씩 기록(실행마다 새 파일).
+
+    timing 진단용 — 페달을 밟고 있는데도 수신측(.12)에서 50ms 이상 간격이
+    생기는 원인을 송신측에서 잡기 위해, 모든 패킷의 KST 벽시계 시각 + 직전
+    송신과의 간격(dt_ms) + 활성 side/deadman + 패킷 JSON 을 전부 남긴다.
+    dt_ms 가 GAP_THRESHOLD_MS 를 넘으면 라인에 [GAP] 토큰을 붙인다.
+    """
+
+    def __init__(self, log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+        stamp = _kst_now().strftime("%Y%m%d_%H%M%S")
+        self.path = os.path.join(log_dir, f"umi_teleop_publish_{stamp}_KST.log")
+        # line-buffered: 매 줄 flush → 크래시/강제종료에도 직전까지 보존
+        self.fh = open(self.path, "w", buffering=1, encoding="utf-8")
+        self._last_perf = None
+        self.fh.write(f"# umi_teleop_publish packet log  started={_kst_now().isoformat()}\n")
+        self.fh.write("# fields: <KST wallclock>  dt_ms=<직전 송신과 간격>  "
+                      "mono=<packet t>  sides=<활성>  deadman=<L?R?>  "
+                      "GAP_token(>50ms)  <packet json>\n")
+
+    def log(self, perf_now, packet):
+        dt_ms = -1.0 if self._last_perf is None else (perf_now - self._last_perf) * 1000.0
+        self._last_perf = perf_now
+        wall = _kst_now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        active = [n for n in SIDES if n in packet]
+        dead = "".join(
+            f"{n[0].upper()}{int(bool(packet.get(n, {}).get('deadman')))}" for n in SIDES
+        )
+        gap = " [GAP]" if dt_ms > GAP_THRESHOLD_MS else ""
+        self.fh.write(
+            f"{wall}  dt_ms={dt_ms:7.2f}  mono={packet.get('t', 0.0):.6f}  "
+            f"sides={','.join(active) or '-'}  deadman={dead}{gap}  "
+            f"{json.dumps(packet, separators=(',', ':'))}\n"
+        )
+
+    def close(self):
+        try:
+            self.fh.write(f"# closed={_kst_now().isoformat()}\n")
+            self.fh.close()
+        except (OSError, ValueError):
+            pass
 
 
 # ----------------------------- 순수 패킷 빌더 (하드웨어/openvr 불필요, 테스트 가능) -----------------------------
@@ -365,6 +419,11 @@ def get_arguments():
                          "그리퍼는 이제 robotics_lab PC 에 직결 — 시리얼 옵션은 그쪽 스크립트로 이전")
     ap.add_argument("--show-sdk-parse-errors", action="store_true",
                     help="Pika SDK 시리얼 JSON 파싱 오류를 스로틀된 경고로 표시")
+    ap.add_argument("--no-packet-log", action="store_true",
+                    help="UDP 송신 패킷 로깅 비활성(기본은 실행마다 pika/logs/ 하위에 "
+                         "KST 타임스탬프 파일로 모든 송신 패킷을 기록 — timing 진단용)")
+    ap.add_argument("--packet-log-dir", default=os.path.join(REPO_ROOT, "logs"),
+                    help="패킷 로그 디렉터리(기본 pika/logs)")
     ap.add_argument("--verbose", action="store_true")
     args, _ = ap.parse_known_args()
     return args
@@ -395,6 +454,10 @@ def main():
     if a.gripper_port:
         targets.append((a.target_host, a.gripper_port))
     log.info("[umi] 송신 대상: %s (포즈 좌/우 + 그리퍼 브리지, 동일 패킷)", targets)
+
+    pkt_log = None if a.no_packet_log else PacketLogger(a.packet_log_dir)
+    if pkt_log is not None:
+        log.info("[umi] 패킷 로그(KST): %s", pkt_log.path)
 
     if a.pedal:
         clutch = PedalClutch(a.pedal_device, toggle=a.pedal_toggle).start()
@@ -444,6 +507,8 @@ def main():
             data = json.dumps(packet).encode("utf-8")
             for tgt in targets:
                 sock.sendto(data, tgt)
+            if pkt_log is not None:
+                pkt_log.log(time.perf_counter(), packet)
 
             now = time.time()
             if a.verbose and now - last_log > 0.5:
@@ -461,6 +526,8 @@ def main():
         clutch.close()
         sock.close()
         rec.stop()
+        if pkt_log is not None:
+            pkt_log.close()
         log.info("[umi] 종료")
 
 
