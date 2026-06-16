@@ -19,6 +19,7 @@ import re
 import shutil
 import socket
 import sys
+import threading
 import time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +31,10 @@ import numpy as np
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_ROOT = os.path.join(REPO_ROOT, "data")
+
+
+def _log(message):
+    print(f"[review] {message}", flush=True)
 
 
 def _latest_episode():
@@ -150,13 +155,22 @@ def _depth_raw_to_mm(h5, source_base):
     return depth_scale * 1000.0 if depth_scale > 0 else 1.0
 
 
-def _depth_visualization(depth, raw_to_mm):
+def _depth_lut(raw_to_mm):
+    depth_mm = np.arange(65536, dtype=np.float32) * float(raw_to_mm)
+    return (np.clip(depth_mm, 0.0, 1000.0) * (255.0 / 1000.0)).astype(np.uint8)
+
+
+def _depth_visualization(depth, lut):
     if depth is None:
         return None
-    depth_mm = depth.astype(np.float32) * float(raw_to_mm)
-    valid = depth_mm > 0.0
-    scaled = np.clip(depth_mm, 0.0, 1000.0) * (255.0 / 1000.0)
-    gray = scaled.astype(np.uint8)
+    height, width = depth.shape[:2]
+    depth = cv2.resize(
+        depth,
+        (max(1, width // 2), max(1, height // 2)),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    valid = depth > 0
+    gray = lut[depth]
     vis = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
     vis[~valid] = 0
     return vis
@@ -176,7 +190,11 @@ def _write_image_assets(h5, display_arm, source_base, output_dir, asset_prefix, 
     is_depth = dataset_key.endswith("depth")
     ext = ".png" if is_depth or encoding not in ("jpg", "jpeg") else ".jpg"
     raw_to_mm = _depth_raw_to_mm(h5, source_base) if is_depth else 1.0
+    depth_lut = _depth_lut(raw_to_mm) if is_depth else None
 
+    t0 = time.perf_counter()
+    written = 0
+    _log(f"extracting {asset_prefix}/{display_arm}/{stream_name}: {len(ds)} frames")
     for idx in range(len(ds)):
         buf = np.asarray(ds[idx], dtype=np.uint8)
         if buf.size == 0:
@@ -187,20 +205,23 @@ def _write_image_assets(h5, display_arm, source_base, output_dir, asset_prefix, 
         if encoding in ("jpg", "jpeg") and not is_depth:
             with open(path, "wb") as f:
                 f.write(buf.tobytes())
+            written += 1
         else:
             img = _decode_image(buf, encoding)
             if img is None:
                 urls.append(None)
                 continue
             if is_depth:
-                img = _depth_visualization(img, raw_to_mm)
+                img = _depth_visualization(img, depth_lut)
                 if img is None:
                     urls.append(None)
                     continue
             elif img.dtype == np.uint16:
                 img = cv2.convertScaleAbs(img, alpha=0.03)
             cv2.imwrite(path, img)
+            written += 1
         urls.append(posixpath.join("assets", _safe_name(asset_prefix), _safe_name(display_arm), stream_name, name))
+    _log(f"wrote {asset_prefix}/{display_arm}/{stream_name}: {written}/{len(ds)} frames in {time.perf_counter() - t0:.1f}s")
     return urls
 
 
@@ -281,13 +302,35 @@ def _extract_episode(path, output_dir, swap_arm_images=False, clear_output=True,
     return metadata
 
 
-def _extract_session(paths, output_dir, swap_arm_images=False):
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir)
-    os.makedirs(os.path.join(output_dir, "assets"), exist_ok=True)
+def _session_metadata(paths, episodes, build_complete=True, build_error=None):
+    session_dir = os.path.dirname(os.path.abspath(paths[0]))
+    return {
+        "sessionPath": session_dir,
+        "sessionName": os.path.basename(session_dir),
+        "episodeCount": len(paths),
+        "readyCount": len(episodes),
+        "buildComplete": bool(build_complete),
+        "buildError": build_error,
+        "episodes": episodes,
+    }
+
+
+def _write_metadata(metadata, output_dir):
+    path = os.path.join(output_dir, "metadata.json")
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, allow_nan=False)
+    os.replace(tmp_path, path)
+    return path
+
+
+def _extract_session_episodes(paths, output_dir, swap_arm_images=False, start_index=1, total_count=None):
     episodes = []
-    for path in paths:
+    total_count = total_count or (start_index + len(paths) - 1)
+    for offset, path in enumerate(paths):
+        idx = start_index + offset
         stem = os.path.splitext(os.path.basename(path))[0]
+        _log(f"episode {idx}/{total_count}: {os.path.basename(path)}")
         episodes.append(_extract_episode(
             path,
             output_dir,
@@ -295,13 +338,58 @@ def _extract_session(paths, output_dir, swap_arm_images=False):
             clear_output=False,
             asset_prefix=stem,
         ))
-    session_dir = os.path.dirname(os.path.abspath(paths[0]))
-    return {
-        "sessionPath": session_dir,
-        "sessionName": os.path.basename(session_dir),
-        "episodeCount": len(episodes),
-        "episodes": episodes,
-    }
+    return episodes
+
+
+def _extract_session(paths, output_dir, swap_arm_images=False):
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(os.path.join(output_dir, "assets"), exist_ok=True)
+    episodes = _extract_session_episodes(
+        paths,
+        output_dir,
+        swap_arm_images=swap_arm_images,
+        total_count=len(paths),
+    )
+    return _session_metadata(paths, episodes, build_complete=True)
+
+
+def _extract_session_initial(paths, output_dir, swap_arm_images=False):
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(os.path.join(output_dir, "assets"), exist_ok=True)
+    episodes = _extract_session_episodes(
+        paths[:1],
+        output_dir,
+        swap_arm_images=swap_arm_images,
+        total_count=len(paths),
+    )
+    return _session_metadata(paths, episodes, build_complete=len(paths) <= 1)
+
+
+def _build_session_remainder(paths, output_dir, metadata, swap_arm_images=False):
+    try:
+        for idx, path in enumerate(paths[1:], 2):
+            episode = _extract_session_episodes(
+                [path],
+                output_dir,
+                swap_arm_images=swap_arm_images,
+                start_index=idx,
+                total_count=len(paths),
+            )[0]
+            metadata["episodes"].append(episode)
+            metadata["readyCount"] = len(metadata["episodes"])
+            metadata["buildComplete"] = metadata["readyCount"] >= metadata["episodeCount"]
+            _write_metadata(metadata, output_dir)
+        metadata["buildComplete"] = True
+        metadata["buildError"] = None
+        _write_metadata(metadata, output_dir)
+        _log("background build complete")
+    except Exception as exc:
+        metadata["buildError"] = f"{type(exc).__name__}: {exc}"
+        metadata["buildComplete"] = False
+        _write_metadata(metadata, output_dir)
+        _log(f"background build failed: {metadata['buildError']}")
 
 
 def _html_template(metadata):
@@ -458,6 +546,7 @@ def _html_template(metadata):
     <h1>Episode Review</h1>
     <div class="meta">
       <span id="episode"></span>
+      <span id="buildStatus"></span>
       <span id="frameSummary"></span>
       <span id="timeSummary"></span>
       <span id="path"></span>
@@ -479,8 +568,8 @@ def _html_template(metadata):
     <section id="views" class="views"></section>
   </main>
   <script>
-    const DATA = {data};
-    const EPISODES = DATA.episodes || [DATA];
+    let DATA = {data};
+    let EPISODES = DATA.episodes || [DATA];
     const state = {{ episode: 0, frame: 0, timer: null }};
     const views = document.getElementById("views");
     const slider = document.getElementById("slider");
@@ -506,6 +595,25 @@ def _html_template(metadata):
     function fmtArray(values, digits = 4) {{
       if (!values || !values.length) return "[]";
       return "[" + values.map(v => fmt(v, digits)).join(", ") + "]";
+    }}
+
+    function episodeTotal() {{
+      return DATA.episodeCount || EPISODES.length;
+    }}
+
+    function updateBuildStatus() {{
+      const el = document.getElementById("buildStatus");
+      if (!el) return;
+      if (DATA.buildError) {{
+        el.textContent = `build error: ${{DATA.buildError}}`;
+      }} else if (DATA.episodeCount) {{
+        const ready = DATA.readyCount || EPISODES.length;
+        el.textContent = DATA.buildComplete
+          ? `ready ${{ready}} / ${{DATA.episodeCount}}`
+          : `building ${{ready}} / ${{DATA.episodeCount}}`;
+      }} else {{
+        el.textContent = "";
+      }}
     }}
 
     function clampFrame(value) {{
@@ -615,9 +723,12 @@ def _html_template(metadata):
       const sessionName = DATA.sessionName || ep.sessionName;
       document.getElementById("episode").textContent =
         `${{sessionName}} / ${{ep.episodeName}}`;
+      updateBuildStatus();
       document.getElementById("path").textContent = ep.episodePath;
       episodeInput.max = EPISODES.length;
       episodeInput.value = state.episode + 1;
+      document.getElementById("prevEpisode").disabled = state.episode <= 0;
+      document.getElementById("nextEpisode").disabled = state.episode >= EPISODES.length - 1;
       slider.max = Math.max(0, ep.frameCount - 1);
       frameInput.max = Math.max(0, ep.frameCount - 1);
       views.innerHTML = ep.arms.map((arm, idx) => `
@@ -664,7 +775,7 @@ def _html_template(metadata):
       frameInput.value = state.frame;
       const elapsed = ep.elapsed[state.frame] || 0;
       document.getElementById("frameSummary").textContent =
-        `episode ${{state.episode + 1}} / ${{EPISODES.length}}   frame ${{state.frame + 1}} / ${{ep.frameCount}}`;
+        `episode ${{state.episode + 1}} / ${{episodeTotal()}}   frame ${{state.frame + 1}} / ${{ep.frameCount}}`;
       document.getElementById("timeSummary").textContent =
         `t=${{fmt(elapsed, 3)}}s / ${{fmt(ep.durationSec, 3)}}s`;
       ep.arms.forEach((arm, idx) => {{
@@ -720,6 +831,32 @@ def _html_template(metadata):
       }}, frameIntervalMs());
     }}
 
+    async function refreshMetadata() {{
+      try {{
+        const response = await fetch(`metadata.json?t=${{Date.now()}}`, {{ cache: "no-store" }});
+        if (!response.ok) return;
+        const nextData = await response.json();
+        const previousCount = EPISODES.length;
+        const previousEpisode = state.episode;
+        DATA = nextData;
+        EPISODES = DATA.episodes || [DATA];
+        if (!EPISODES.length) return;
+        state.episode = clampEpisode(state.episode);
+        if (EPISODES.length !== previousCount || state.episode !== previousEpisode) {{
+          renderShell();
+          renderFrame(state.frame);
+        }} else {{
+          updateBuildStatus();
+        }}
+        if (metadataTimer !== null && (DATA.buildComplete || DATA.buildError)) {{
+          clearInterval(metadataTimer);
+          metadataTimer = null;
+        }}
+      }} catch (err) {{
+        // The writer replaces metadata atomically, but transient read errors are harmless.
+      }}
+    }}
+
     document.getElementById("prevEpisode").addEventListener("click", () => renderEpisode(state.episode - 1));
     document.getElementById("nextEpisode").addEventListener("click", () => renderEpisode(state.episode + 1));
     episodeInput.addEventListener("change", event => renderEpisode(Number.parseInt(event.target.value, 10) - 1));
@@ -739,6 +876,11 @@ def _html_template(metadata):
 
     renderShell();
     renderFrame(0);
+    let metadataTimer = null;
+    if (DATA.episodeCount && !DATA.buildComplete) {{
+      metadataTimer = setInterval(refreshMetadata, 2000);
+      refreshMetadata();
+    }}
   </script>
 </body>
 </html>
@@ -789,7 +931,7 @@ def _lan_ips():
     return ips
 
 
-def _serve(output_dir, preferred_port):
+def _serve(output_dir, preferred_port, on_started=None):
     port = _free_port(preferred_port)
     handler = partial(SimpleHTTPRequestHandler, directory=output_dir)
     server = ThreadingHTTPServer(("0.0.0.0", port), handler)
@@ -797,6 +939,8 @@ def _serve(output_dir, preferred_port):
     for ip in _lan_ips():
         print(f"[review] LAN URL:   http://{ip}:{port}/")
     print("[review] Ctrl-C to stop")
+    if on_started is not None:
+        on_started()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -838,24 +982,42 @@ def main():
     swap_arm_images = bool(args.swap_arm_images)
 
     t0 = time.perf_counter()
+    worker = None
     if len(paths) == 1:
         metadata = _extract_episode(paths[0], output_dir, swap_arm_images=swap_arm_images)
-    else:
+    elif args.no_serve:
         metadata = _extract_session(paths, output_dir, swap_arm_images=swap_arm_images)
+    else:
+        metadata = _extract_session_initial(paths, output_dir, swap_arm_images=swap_arm_images)
     html_path = _write_html(metadata, output_dir)
+    _write_metadata(metadata, output_dir)
     elapsed = time.perf_counter() - t0
     if len(paths) == 1:
         print(f"[review] episode: {paths[0]}")
     else:
         print(f"[review] session: {os.path.dirname(paths[0])}")
         print(f"[review] episodes: {len(paths)}")
+        print(f"[review] ready:   {metadata['readyCount']} / {metadata['episodeCount']}")
     print(f"[review] output:  {html_path}")
     first = metadata["episodes"][0] if "episodes" in metadata else metadata
     print(f"[review] frames:  {first['frameCount']}  arms: {[a['name'] for a in first['arms']]}")
     print(f"[review] built in {elapsed:.1f}s")
 
     if not args.no_serve:
-        _serve(output_dir, args.port)
+        def start_worker():
+            nonlocal worker
+            worker = threading.Thread(
+                target=_build_session_remainder,
+                args=(paths, output_dir, metadata),
+                kwargs={"swap_arm_images": swap_arm_images},
+                daemon=True,
+            )
+            worker.start()
+
+        on_started = None
+        if len(paths) > 1 and not metadata.get("buildComplete"):
+            on_started = start_worker
+        _serve(output_dir, args.port, on_started=on_started)
 
 
 if __name__ == "__main__":
