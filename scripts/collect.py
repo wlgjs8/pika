@@ -18,6 +18,7 @@ import atexit
 import glob
 import logging
 import os
+import signal
 import struct
 import sys
 import time
@@ -33,6 +34,10 @@ from pika_win.viewer import make_viewer  # noqa: E402
 log = logging.getLogger("collect")
 
 MAX_ARMS = 2  # Vive 양팔
+
+
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
 
 
 class CollectRunLock:
@@ -383,6 +388,7 @@ def main():
     ap.add_argument("--view-img-every", type=int, default=3, help="뷰어 카메라 로깅 간격(프레임)")
     ap.add_argument("--view-mem", default="2GB", help="뷰어 메모리 상한(초과 시 오래된 데이터 폐기)")
     a = ap.parse_args()
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
 
     logging.basicConfig(
         level=logging.DEBUG if a.debug else logging.INFO,
@@ -411,12 +417,21 @@ def main():
     log.info("[out] 세션 폴더: %s", session_dir)
     log.info("[out] 로그 파일: %s", os.path.join(session_dir, "collect.log"))
 
-    rec = EpisodeRecorder(out_dir=session_dir, arms=build_arms(a), record_hz=a.hz,
+    arms = build_arms(a)
+    viewer = None
+    try:
+        viewer = make_viewer(a.view, memory_limit=a.view_mem, img_every=a.view_img_every,
+                             session_dir=session_dir,
+                             arm_names=[arm.name for arm in arms])
+    except Exception:
+        log.exception("[viewer] 초기화 실패")
+        raise
+
+    rec = EpisodeRecorder(out_dir=session_dir, arms=arms, record_hz=a.hz,
                           use_realsense=not a.no_realsense,
                           require_pose=a.require_pose,
                           require_all_trackers=a.require_all_trackers,
                           pose_valid_timeout=a.pose_valid_timeout)
-    viewer = None
     try:
         rec.start()  # ← 트래커 개수로 단일/양팔 자동 결정
 
@@ -429,9 +444,7 @@ def main():
             dets.append(det)
             log.info("[gesture][%s] enter_closed=%.1f enter_open=%.1f dir=%+.0f window=%.1fs min_gap=%.0fms",
                      name, det.enter_closed, det.enter_open, det.dir, det.double_window, det.min_pinch_gap * 1e3)
-        viewer = make_viewer(a.view, memory_limit=a.view_mem, img_every=a.view_img_every,
-                             session_dir=session_dir, arm_names=names)
-    except Exception:
+    except BaseException:
         if viewer is not None:
             viewer.close()
         rec.stop()

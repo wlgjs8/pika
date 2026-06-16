@@ -179,14 +179,18 @@ class RerunViewer:
             lan_ips = _lan_ips()
             gport = _free_port(9876)
             cors_allow_origin = [f"http://{ip}:*" for ip in lan_ips]
+            log.info("[viewer] gRPC 서버 시작 중: port=%d mem<=%s", gport, memory_limit)
             uri = rr.serve_grpc(
                 grpc_port=gport,
                 server_memory_limit=memory_limit,
                 cors_allow_origin=cors_allow_origin,
             )
+            log.info("[viewer] gRPC 서버 시작 완료: %s", uri)
             before = _listening_tcp_ports_for_self()
             wport = _free_port(9090)
+            log.info("[viewer] web 서버 시작 중: port=%d", wport)
             rr.serve_web_viewer(web_port=wport, open_browser=False, connect_to=uri)
+            log.info("[viewer] web 서버 시작 완료")
             time.sleep(0.2)
             after = _listening_tcp_ports_for_self()
             new_ports = sorted((after - before) - {gport})
