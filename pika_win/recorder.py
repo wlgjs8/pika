@@ -1,6 +1,7 @@
 """PIKA Sense 동기화 에피소드 레코더 (Windows/Linux, 단일/양팔 자동).
 
-스트림(팔당): 포즈(SteamVR 트래커) / 그리퍼각도+command(Sense 시리얼) / RealSense(color+depth).
+스트림(팔당): 포즈(SteamVR 트래커) / 그리퍼각도+command(Sense 시리얼) / RealSense(color+depth)
+            / 어안(fisheye color, raw). 어안은 RealSense 와 같은 USB 허브에서 자동 매핑.
 인식된 Vive 트래커 개수로 모드 자동 결정:
   - 1개 → SINGLE(한팔)  : 기존 평면 HDF5 레이아웃 그대로 저장(하위 호환).
   - 2개 → BIMANUAL(양팔): 팔별 그룹(observations/<arm>/...)으로 저장.
@@ -15,7 +16,7 @@ HDF5 레이아웃:
            + attrs realsense_sn
   [BIMANUAL] observations/<arm>/pose,gripper,command,images/{...},action  (팔마다)
            + 그룹 attrs realsense_sn, tracker_sn
-  이미지: realsense_color=JPEG, realsense_depth=PNG16 (vlen-u8)
+  이미지: realsense_color=JPEG, realsense_depth=PNG16, fisheye_color=JPEG (vlen-u8)
   action [.,8] = pose(7) + gripper_distance(1)  (v1=관측 미러)
 """
 import logging
@@ -27,21 +28,27 @@ import numpy as np
 
 from .pose_steamvr import PoseSteamVR
 from .realsense_win import RealSenseD4xx
+from .fisheye import FisheyeCamera, resolve_fisheye_node
 
 log = logging.getLogger("pika.recorder")
 
 
 class ArmSpec:
     """한 팔의 하드웨어 바인딩(설정값)."""
-    def __init__(self, name, com_port=None, realsense_sn=None, tracker_sn=None):
+    def __init__(self, name, com_port=None, realsense_sn=None, tracker_sn=None,
+                 fisheye_dev=None):
         self.name = name
         self.com_port = com_port
         self.realsense_sn = realsense_sn
         self.tracker_sn = tracker_sn
+        # 어안 카메라 디바이스 override(/dev/videoN, 인덱스, by-path).
+        # None 이면 RealSense 와 같은 USB 허브에서 자동 매핑.
+        self.fisheye_dev = fisheye_dev
 
     def __repr__(self):
         return (f"ArmSpec({self.name}, com={self.com_port}, "
-                f"rs={self.realsense_sn}, tracker={self.tracker_sn})")
+                f"rs={self.realsense_sn}, tracker={self.tracker_sn}, "
+                f"fisheye={self.fisheye_dev})")
 
 
 class _ArmIO:
@@ -50,12 +57,14 @@ class _ArmIO:
         self.spec = spec
         self.sense = None
         self.rs = None
+        self.fisheye = None
+        self.fisheye_dev = None   # 런타임에 확정(자동 매핑 또는 spec override)
         self.tracker_sn = spec.tracker_sn   # 런타임에 확정될 수 있음
 
 
 class EpisodeRecorder:
     def __init__(self, out_dir, arms=None, record_hz=30, jpeg_quality=90,
-                 use_pose=True, use_sense=True, use_realsense=True,
+                 use_pose=True, use_sense=True, use_realsense=True, use_fisheye=True,
                  settle=1.0, require_pose=False, require_all_trackers=False,
                  pose_valid_timeout=2.0, pose_tip_frame=False,
                  # ---- 레거시 단일-팔 호환 kwargs (arms 미지정 시 사용) ----
@@ -67,7 +76,8 @@ class EpisodeRecorder:
         self.arms_cfg = list(arms)
         self.record_hz = record_hz
         self.jpeg_quality = jpeg_quality
-        self.flags = dict(pose=use_pose, sense=use_sense, realsense=use_realsense)
+        self.flags = dict(pose=use_pose, sense=use_sense, realsense=use_realsense,
+                          fisheye=use_fisheye)
         self.settle = settle
         self.require_pose = bool(require_pose)
         self.require_all_trackers = bool(require_all_trackers)
@@ -121,6 +131,25 @@ class EpisodeRecorder:
                 s = io.spec
                 io.rs = RealSenseD4xx(serial=(s.realsense_sn or None)).connect()
                 log.info("[%s] realsense %s connected", s.name, s.realsense_sn or "(auto)")
+        if self.flags["fisheye"]:
+            for io in self.active:
+                s = io.spec
+                # 1) spec override 우선, 2) 없으면 RealSense 와 같은 USB 허브에서 자동 매핑
+                dev = s.fisheye_dev
+                if dev in (None, "", "auto"):
+                    rs_port = getattr(io.rs, "physical_port", None) if io.rs else None
+                    dev = resolve_fisheye_node(rs_port) if rs_port else None
+                if not dev:
+                    log.warning("[%s] 어안 카메라 미발견 — RealSense 허브 매핑 실패. "
+                                "config fisheye_dev 또는 --fisheye-devs 로 지정하세요.", s.name)
+                    continue
+                try:
+                    io.fisheye = FisheyeCamera(dev).connect()
+                    io.fisheye_dev = dev
+                    log.info("[%s] fisheye %s connected", s.name, dev)
+                except Exception as e:
+                    log.error("[%s] 어안 카메라 연결 실패(%s): %s", s.name, dev, e)
+                    io.fisheye = None
         for io in self.active:
             log.info("[%s] tracker → %s", io.spec.name, io.tracker_sn or "(순서배정)")
         time.sleep(0.8)
@@ -263,6 +292,10 @@ class EpisodeRecorder:
             c, d, _ = io.rs.get_frames()
             arm["realsense_color"] = self._jpg(c)
             arm["realsense_depth"] = self._png16(d)
+        # 어안 카메라(raw fisheye → JPEG)
+        if io.fisheye is not None:
+            fc, _ = io.fisheye.get_frame()
+            arm["fisheye_color"] = self._jpg(fc)
         return arm
 
     def read_frame(self):
@@ -291,6 +324,7 @@ class EpisodeRecorder:
 
         _vds("realsense_color")
         _vds("realsense_depth")
+        _vds("fisheye_color")
         return _np.concatenate([pose, grip[:, 1:2]], axis=1).astype(_np.float32)
 
     def write_episode(self, path, frames):
@@ -320,6 +354,7 @@ class EpisodeRecorder:
                 # ---- 기존 평면 레이아웃(하위 호환) ----
                 s = self.active[0].spec if self.active else self.arms_cfg[0]
                 h.attrs["realsense_sn"] = str(s.realsense_sn or "")
+                h.attrs["fisheye_dev"] = str(self.active[0].fisheye_dev or "") if self.active else ""
                 obs = h.create_group("observations")
                 action = self._write_obs(obs, frames, 0, vlen)
                 h.create_dataset("action", data=action)
@@ -330,6 +365,7 @@ class EpisodeRecorder:
                     s = self.active[ai].spec
                     g.attrs["realsense_sn"] = str(s.realsense_sn or "")
                     g.attrs["tracker_sn"] = str(self.active[ai].tracker_sn or "")
+                    g.attrs["fisheye_dev"] = str(self.active[ai].fisheye_dev or "")
                     action = self._write_obs(g, frames, ai, vlen)
                     g.create_dataset("action", data=action)
         print(f"[rec] 저장 {path}  frames={len(frames)}  arms={n}  eff_hz={eff:.1f}")
@@ -351,7 +387,7 @@ class EpisodeRecorder:
 
     def stop(self):
         for io in self.active:
-            for c in (io.rs, io.sense):
+            for c in (io.rs, io.sense, io.fisheye):
                 try:
                     if c is not None:
                         c.disconnect()

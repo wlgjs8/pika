@@ -324,6 +324,9 @@ class RerunViewer:
         rd = arm.get("realsense_depth")
         if rd is not None and rd.size > 0:
             rr.log(f"camera/{name}/d405_depth", rr.EncodedImage(contents=rd.tobytes(), media_type="image/png"))
+        fc = arm.get("fisheye_color")
+        if fc is not None and fc.size > 0:
+            rr.log(f"camera/{name}/fisheye_color", rr.EncodedImage(contents=fc.tobytes(), media_type="image/jpeg"))
 
     def close(self):
         pass

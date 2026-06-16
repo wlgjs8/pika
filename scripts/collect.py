@@ -169,12 +169,19 @@ def build_arms(a):
                     com_port=com_port,
                     realsense_sn=d.get("realsense_sn") or None,
                     tracker_sn=d.get("tracker_sn") or None,
+                    fisheye_dev=d.get("fisheye_dev") or None,
                 ))
+            # config 가 fisheye_dev 를 안 줘도 CLI --fisheye-devs 로 override 가능
+            fde = _split(a.fisheye_devs)
+            if fde:
+                for i, arm in enumerate(arms):
+                    arm.fisheye_dev = _at(fde, i, arm.fisheye_dev)
             return arms[:MAX_ARMS]
 
     # 2) config 없으면 CLI 리스트(쉼표 구분). 활성 개수는 런타임 트래커 수가 결정.
     names = _split(a.arm_names) or ["right", "left"]
     coms, rss, tss = _split(a.coms), _split(a.rs_sns), _split(a.tracker_sns)
+    fde = _split(a.fisheye_devs)
     arms = []
     for i in range(MAX_ARMS):
         arms.append(ArmSpec(
@@ -182,6 +189,7 @@ def build_arms(a):
             com_port=_at(coms, i),
             realsense_sn=_at(rss, i),
             tracker_sn=_at(tss, i),
+            fisheye_dev=_at(fde, i),
         ))
     return arms
 
@@ -362,6 +370,11 @@ def main():
                     help="REC 시작 직후 이 시간 안의 정지 토글은 무시")
     ap.add_argument("--start-index", type=int, default=0)
     ap.add_argument("--no-realsense", action="store_true")
+    ap.add_argument("--no-fisheye", action="store_true",
+                    help="그리퍼 어안 카메라 수집 비활성화")
+    ap.add_argument("--fisheye-devs", default="",
+                    help="팔별 어안 디바이스(쉼표; /dev/videoN 또는 인덱스). "
+                         "빈칸=RealSense 와 같은 USB 허브에서 자동 매핑")
     ap.add_argument("--require-pose", action="store_true",
                     help="SteamVR/OpenVR pose와 active tracker pose가 유효하지 않으면 시작하지 않음")
     ap.add_argument("--require-all-trackers", action="store_true",
@@ -429,6 +442,7 @@ def main():
 
     rec = EpisodeRecorder(out_dir=session_dir, arms=arms, record_hz=a.hz,
                           use_realsense=not a.no_realsense,
+                          use_fisheye=not a.no_fisheye,
                           require_pose=a.require_pose,
                           require_all_trackers=a.require_all_trackers,
                           pose_valid_timeout=a.pose_valid_timeout)

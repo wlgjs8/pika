@@ -18,6 +18,7 @@ class RealSenseD4xx:
         self.align_to_color = align_to_color
         self.pipe = None
         self.align = None
+        self.physical_port = None
         self._color = None
         self._depth = None
         self._ts = 0.0
@@ -32,7 +33,11 @@ class RealSenseD4xx:
             cfg.enable_device(str(self.serial))
         cfg.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
         cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
-        self.pipe.start(cfg)
+        profile = self.pipe.start(cfg)
+        try:
+            self.physical_port = profile.get_device().get_info(rs.camera_info.physical_port)
+        except Exception:
+            self.physical_port = None
         self.align = rs.align(rs.stream.color) if self.align_to_color else None
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="RealSense", daemon=True)
