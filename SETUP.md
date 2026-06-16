@@ -109,6 +109,7 @@ WSL2/usbipd 경로는 두 하드웨어 전선에서 막혔다:
 
 ### Phase D — 캘리브레이션
 - 어안 인트린식, 트래커↔카메라 익스트린식(hand-eye), depth-color 정렬
+- ✅ RS color/depth intrinsics + depth↔color extrinsic + stereo baseline → 에피소드 `camera_calib` 그룹 자동 저장(2026-06-16, `recorder.py`/`realsense_win.py`)
 
 ### Phase E — 검증
 - 포즈 안정성, 프레임 드롭, 타임스탬프 정합, 에피소드 재생/시각화
@@ -118,7 +119,8 @@ WSL2/usbipd 경로는 두 하드웨어 전선에서 막혔다:
 - [x] Phase A: SteamVR 헤드리스 + `pose_test_openvr.py` 포즈 스트림 확인 (트래커 LHR-40B32551)
 - [x] Phase B: 스트림 리더 — 포즈(`PoseSteamVR`)/그리퍼(`Sense`@COM3, AS5047)/어안(`FisheyeCameraWin` idx2)/RealSense(D405 SN 260522277606). **Sense 시리얼엔 IMU 없음**(IMU=트래커 융합)
 - [x] Phase C: 동기화 레코더 → HDF5 (`pika_win/recorder.py`; 118f@29.4Hz, pose 118/118 valid, 이미지 3종 디코드 OK)
-- [ ] Phase D: 캘리브레이션 (트래커↔카메라 extrinsics/hand-eye, 어안 intrinsics, RS intrinsics 저장)
+- [x] Phase D(부분): RS color/depth intrinsics·depth↔color extrinsic·stereo baseline 에피소드 저장 (`camera_calib`, 2026-06-16)
+- [ ] Phase D(잔여): 트래커↔카메라 extrinsics/hand-eye, 어안 intrinsics 저장
 - [x] Phase C+: 에피소드 제어 — **그리퍼 더블-핀치 토글 + rerun 실시간 피드백** (`scripts/collect.py`, `pika_win/gesture.py`)
 - [ ] Phase C++: `action` 정의 확정, `agilexrobotics/data_tools`/ACT 스키마 정합
 - [ ] Phase E: 다중 에피소드 검증/재생

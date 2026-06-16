@@ -327,6 +327,33 @@ class EpisodeRecorder:
         _vds("fisheye_color")
         return _np.concatenate([pose, grip[:, 1:2]], axis=1).astype(_np.float32)
 
+    def _write_camera_calib(self, grp, io):
+        """RealSense 정적 캘리브(intrinsics/extrinsic)를 grp/camera_calib 에 기록."""
+        import numpy as _np
+        calib = getattr(io.rs, "calib", None) if (io is not None and io.rs is not None) else None
+        if not calib:
+            return
+        cc = grp.create_group("camera_calib")
+        for key in ("color_intrinsics", "depth_intrinsics"):
+            intr = calib.get(key)
+            if not intr:
+                continue
+            sub = cc.create_group(key)
+            for k in ("width", "height", "fx", "fy", "ppx", "ppy", "model"):
+                sub.attrs[k] = intr[k]
+            sub.create_dataset("coeffs", data=_np.asarray(intr["coeffs"], _np.float64))
+        # column-major 9 -> 실제 3x3 회전행렬 (p_color = R @ p_depth + t)
+        R = _np.asarray(calib["depth_to_color_rotation"], _np.float64).reshape((3, 3), order="F")
+        cc.create_dataset("depth_to_color_rotation", data=R)
+        cc.create_dataset("depth_to_color_translation",
+                          data=_np.asarray(calib["depth_to_color_translation"], _np.float64))
+        cc.attrs["rotation_layout"] = "row_major_3x3; p_color = R @ p_depth + t"
+        cc.attrs["translation_units"] = "meters"
+        cc.attrs["depth_scale"] = calib["depth_scale"]
+        if calib.get("stereo_baseline_mm") is not None:
+            cc.attrs["stereo_baseline_mm"] = calib["stereo_baseline_mm"]
+        cc.attrs["depth_aligned_to_color"] = calib["depth_aligned_to_color"]
+
     def write_episode(self, path, frames):
         """프레임 리스트 → HDF5. 활성 팔 수에 따라 평면(단일)/그룹(양팔) 레이아웃."""
         import h5py
@@ -358,6 +385,8 @@ class EpisodeRecorder:
                 obs = h.create_group("observations")
                 action = self._write_obs(obs, frames, 0, vlen)
                 h.create_dataset("action", data=action)
+                if self.active:
+                    self._write_camera_calib(obs, self.active[0])
             else:
                 # ---- 양팔: 팔별 그룹 ----
                 for ai, name in enumerate(names):
@@ -368,6 +397,7 @@ class EpisodeRecorder:
                     g.attrs["fisheye_dev"] = str(self.active[ai].fisheye_dev or "")
                     action = self._write_obs(g, frames, ai, vlen)
                     g.create_dataset("action", data=action)
+                    self._write_camera_calib(g, self.active[ai])
         print(f"[rec] 저장 {path}  frames={len(frames)}  arms={n}  eff_hz={eff:.1f}")
         return path
 

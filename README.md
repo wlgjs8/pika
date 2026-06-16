@@ -10,6 +10,7 @@ AgileX PIKA Sense 기반 데이터 수집을 위한 Python 도구입니다. Vive
 - SteamVR/OpenVR 기반 Vive Tracker 6DoF 포즈 수집
 - PIKA Sense 시리얼 그리퍼 각도/명령 수집
 - RealSense D4xx 컬러/뎁스 프레임 수집
+- RealSense color/depth intrinsics·depth↔color extrinsic·stereo baseline을 에피소드에 저장
 - 좌/우 팔 하드웨어 매핑을 `config/arms.json`에 저장
 - `b` 키 또는 Linux FootSwitch 입력으로 에피소드 녹화 시작/정지
 - 수집 데이터 분석, HDF5 구조 확인, 브라우저 기반 에피소드 리뷰
@@ -208,6 +209,35 @@ conda run --no-capture-output -n pika python scripts/inspect_hdf5.py data/data_Y
 
 데이터셋 shape, attrs, 샘플 값, 첫 프레임 미리보기를 확인합니다.
 
+## 에피소드 HDF5 레이아웃
+
+활성 팔 수에 따라 평면(단일)/팔별 그룹(양팔)으로 저장합니다.
+공통 attrs: `record_hz`, `effective_hz`, `pose_frame`, `pose_format`, `n_arms`, `arm_names`.
+
+- 단일팔: `observations/{pose,gripper,command,images/...}`, 최상위 `action`, `timestamp`
+- 양팔: `observations/<arm>/{pose,gripper,command,images/...,action}`(팔마다), 최상위 `timestamp`
+- 이미지(vlen-u8): `realsense_color`=JPEG, `realsense_depth`=PNG16, `fisheye_color`=JPEG
+
+### 카메라 캘리브레이션 (`camera_calib`)
+
+각 팔 관측 그룹 아래 RealSense 정적 캘리브를 에피소드당 1회 저장합니다
+(단일팔 `observations/camera_calib`, 양팔 `observations/<arm>/camera_calib`).
+
+```text
+camera_calib
+├── color_intrinsics/   attrs: width,height,fx,fy,ppx,ppy,model  + coeffs[5]
+├── depth_intrinsics/   attrs: width,height,fx,fy,ppx,ppy,model  + coeffs[5]
+├── depth_to_color_rotation     [3,3]   # row-major, p_color = R @ p_depth + t
+├── depth_to_color_translation  [3]     # meters
+└── attrs: depth_scale, stereo_baseline_mm, depth_aligned_to_color,
+          rotation_layout, translation_units
+```
+
+- `depth_aligned_to_color=True`이므로 저장된 depth는 color 프레임 기준입니다.
+  저장 depth를 deproject할 땐 `color_intrinsics`를 사용하세요(depth↔color extrinsic은 거의 identity).
+- `stereo_baseline_mm`은 depth 스테레오 IR 이미저 간 baseline(mm)입니다.
+- 트래커↔카메라(hand-eye) extrinsic은 별도이며 여기 포함되지 않습니다(미측정).
+
 ## Makefile 명령
 
 ```bash
@@ -233,6 +263,17 @@ make view VIEW=web ARGS="--hz 30"
 - `--require-all-trackers`: 설정된 모든 트래커가 보일 때만 시작
 - `--no-pedal`: FootSwitch 입력 비활성화
 - `--start-index N`: 에피소드 번호 시작값 지정
+
+## 문제 해결
+
+### `make view`(web 뷰어)가 `[viewer] gRPC 서버 시작 중`에서 멈춤
+
+rerun 네이티브 `rr.serve_grpc()`가 드물게 시작 직후 리턴하지 않는 **일회성 데드락**입니다.
+포트(9876)는 LISTEN 상태로 바인딩됐지만 `gRPC 서버 시작 완료` 로그가 안 찍힙니다.
+메모리/디스크 문제가 아닙니다(동일 코드/포트로 재현되지 않는 transient race).
+
+- 조치: `Ctrl-C`로 종료 후 재실행하면 대부분 풀립니다.
+- 헤드리스 수집만 필요하면 `make run`(`--view` 없이)으로 우회할 수 있습니다.
 
 ## Git에 포함하지 않는 파일
 
