@@ -132,17 +132,50 @@ def _decode_image(buf, encoding):
     return cv2.imdecode(arr, flag)
 
 
-def _write_color_assets(h5, display_arm, source_base, output_dir, asset_prefix=""):
-    img_group = h5.get(f"{source_base}/images")
-    if img_group is None or "realsense_color" not in img_group:
-        return [None] * len(h5["timestamp"])
+IMAGE_STREAMS = (
+    ("realsenseColor", "realsense_color", "D405 Color"),
+    ("fisheyeColor", "fisheye_color", "Fisheye"),
+    ("realsenseDepth", "realsense_depth", "Depth 0-1000 mm"),
+)
 
-    ds = img_group["realsense_color"]
+
+def _depth_raw_to_mm(h5, source_base):
+    calib = h5.get(f"{source_base}/camera_calib")
+    if calib is None:
+        return 1.0
+    try:
+        depth_scale = float(calib.attrs.get("depth_scale", 0.0))
+    except (TypeError, ValueError):
+        return 1.0
+    return depth_scale * 1000.0 if depth_scale > 0 else 1.0
+
+
+def _depth_visualization(depth, raw_to_mm):
+    if depth is None:
+        return None
+    depth_mm = depth.astype(np.float32) * float(raw_to_mm)
+    valid = depth_mm > 0.0
+    scaled = np.clip(depth_mm, 0.0, 1000.0) * (255.0 / 1000.0)
+    gray = scaled.astype(np.uint8)
+    vis = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+    vis[~valid] = 0
+    return vis
+
+
+def _write_image_assets(h5, display_arm, source_base, output_dir, asset_prefix, dataset_key):
+    img_group = h5.get(f"{source_base}/images")
+    if img_group is None or dataset_key not in img_group:
+        return None
+
+    ds = img_group[dataset_key]
     encoding = _attr_text(ds.attrs.get("encoding", "jpeg")).lower()
-    arm_dir = os.path.join(output_dir, "assets", _safe_name(asset_prefix), _safe_name(display_arm))
+    stream_name = _safe_name(dataset_key)
+    arm_dir = os.path.join(output_dir, "assets", _safe_name(asset_prefix), _safe_name(display_arm), stream_name)
     os.makedirs(arm_dir, exist_ok=True)
     urls = []
-    ext = ".jpg"
+    is_depth = dataset_key.endswith("depth")
+    ext = ".png" if is_depth or encoding not in ("jpg", "jpeg") else ".jpg"
+    raw_to_mm = _depth_raw_to_mm(h5, source_base) if is_depth else 1.0
 
     for idx in range(len(ds)):
         buf = np.asarray(ds[idx], dtype=np.uint8)
@@ -151,7 +184,7 @@ def _write_color_assets(h5, display_arm, source_base, output_dir, asset_prefix="
             continue
         name = f"frame_{idx:06d}{ext}"
         path = os.path.join(arm_dir, name)
-        if encoding in ("jpg", "jpeg"):
+        if encoding in ("jpg", "jpeg") and not is_depth:
             with open(path, "wb") as f:
                 f.write(buf.tobytes())
         else:
@@ -159,11 +192,27 @@ def _write_color_assets(h5, display_arm, source_base, output_dir, asset_prefix="
             if img is None:
                 urls.append(None)
                 continue
-            if img.dtype == np.uint16:
+            if is_depth:
+                img = _depth_visualization(img, raw_to_mm)
+                if img is None:
+                    urls.append(None)
+                    continue
+            elif img.dtype == np.uint16:
                 img = cv2.convertScaleAbs(img, alpha=0.03)
             cv2.imwrite(path, img)
-        urls.append(posixpath.join("assets", _safe_name(asset_prefix), _safe_name(display_arm), name))
+        urls.append(posixpath.join("assets", _safe_name(asset_prefix), _safe_name(display_arm), stream_name, name))
     return urls
+
+
+def _write_stream_assets(h5, display_arm, source_base, output_dir, asset_prefix=""):
+    streams = {}
+    labels = {}
+    for stream_id, dataset_key, label in IMAGE_STREAMS:
+        urls = _write_image_assets(h5, display_arm, source_base, output_dir, asset_prefix, dataset_key)
+        if urls is not None:
+            streams[stream_id] = urls
+            labels[stream_id] = label
+    return streams, labels
 
 
 def _extract_episode(path, output_dir, swap_arm_images=False, clear_output=True, asset_prefix=None):
@@ -188,6 +237,8 @@ def _extract_episode(path, output_dir, swap_arm_images=False, clear_output=True,
                     "name": arm,
                     "present": False,
                     "images": [None] * len(timestamps),
+                    "streams": {},
+                    "streamLabels": {},
                     "pose": [],
                     "gripper": [],
                     "poseValid": 0,
@@ -197,12 +248,16 @@ def _extract_episode(path, output_dir, swap_arm_images=False, clear_output=True,
             gripper = np.asarray(h5[f"{base}/gripper"][...], dtype=np.float64)
             image_source_arm = _image_source_arm(arm, arm_names, swap_arm_images)
             image_source_base = _arm_base(h5, image_source_arm)
-            images = _write_color_assets(h5, arm, image_source_base, output_dir, asset_prefix=asset_prefix)
+            streams, stream_labels = _write_stream_assets(
+                h5, arm, image_source_base, output_dir, asset_prefix=asset_prefix
+            )
             pose_valid = int(np.sum(np.isfinite(pose[:, 0]))) if pose.ndim == 2 and pose.shape[0] else 0
             arms.append({
                 "name": arm,
                 "present": True,
-                "images": images,
+                "images": streams.get("realsenseColor", [None] * len(timestamps)),
+                "streams": streams,
+                "streamLabels": stream_labels,
                 "pose": _matrix_to_jsonable(pose),
                 "gripper": _matrix_to_jsonable(gripper),
                 "poseValid": pose_valid,
@@ -352,6 +407,23 @@ def _html_template(metadata):
       align-items: center;
       justify-content: center;
     }}
+    .stream-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1px;
+      background: var(--line);
+    }}
+    .stream {{
+      min-width: 0;
+      background: #111820;
+    }}
+    .stream-title {{
+      padding: 7px 9px;
+      color: #d6dee8;
+      background: #18202a;
+      font-size: 12px;
+      font-weight: 650;
+    }}
     .image-wrap img {{
       display: block;
       width: 100%;
@@ -418,6 +490,12 @@ def _html_template(metadata):
     const preloadSeen = new Set();
     const preloadQueue = [];
     const maxPreloadRefs = 96;
+    const streamOrder = ["realsenseColor", "fisheyeColor", "realsenseDepth"];
+    const defaultStreamLabels = {{
+      realsenseColor: "D405 Color",
+      fisheyeColor: "Fisheye",
+      realsenseDepth: "Depth 0-1000 mm",
+    }};
 
     function fmt(value, digits = 4) {{
       if (value === null || value === undefined) return "NaN";
@@ -471,9 +549,64 @@ def _html_template(metadata):
         const next = frame + offset;
         if (next >= ep.frameCount) break;
         ep.arms.forEach(arm => {{
-          const url = arm.images ? arm.images[next] : null;
-          preloadUrl(url);
+          streamEntries(arm).forEach(stream => {{
+            preloadUrl(stream.urls ? stream.urls[next] : null);
+          }});
         }});
+      }}
+    }}
+
+    function streamEntries(arm) {{
+      if (arm.streams) {{
+        return streamOrder
+          .filter(key => arm.streams[key])
+          .map(key => ({{
+            key,
+            label: (arm.streamLabels && arm.streamLabels[key]) || defaultStreamLabels[key] || key,
+            urls: arm.streams[key],
+          }}));
+      }}
+      return arm.images ? [{{ key: "realsenseColor", label: "D405 Color", urls: arm.images }}] : [];
+    }}
+
+    function renderImageSlot(img, empty, url, alt) {{
+      if (url) {{
+        if (img.dataset.currentSrc) {{
+          empty.classList.add("hidden");
+        }} else {{
+          empty.textContent = "Loading image";
+          empty.classList.remove("hidden");
+        }}
+        if (img.dataset.currentSrc === url) {{
+          img.alt = alt;
+          img.classList.remove("hidden");
+          empty.classList.add("hidden");
+        }} else {{
+          img.dataset.pendingSrc = url;
+          const loader = new Image();
+          loader.onload = () => {{
+            if (img.dataset.pendingSrc !== url) return;
+            img.src = url;
+            img.alt = alt;
+            img.dataset.currentSrc = url;
+            img.classList.remove("hidden");
+            empty.classList.add("hidden");
+          }};
+          loader.onerror = () => {{
+            if (img.dataset.pendingSrc !== url || img.dataset.currentSrc) return;
+            img.classList.add("hidden");
+            empty.textContent = "Image failed";
+            empty.classList.remove("hidden");
+          }};
+          loader.src = url;
+        }}
+      }} else {{
+        img.dataset.pendingSrc = "";
+        img.dataset.currentSrc = "";
+        img.removeAttribute("src");
+        img.classList.add("hidden");
+        empty.textContent = "No image";
+        empty.classList.remove("hidden");
       }}
     }}
 
@@ -493,9 +626,23 @@ def _html_template(metadata):
             <h2>${{arm.name}}</h2>
             <span class="badge">${{arm.present ? `${{arm.poseValid}}/${{ep.frameCount}} pose valid` : "not present"}}</span>
           </div>
-          <div class="image-wrap" id="imageWrap-${{idx}}">
-            <img id="image-${{idx}}" class="hidden" alt="">
-            <div id="empty-${{idx}}" class="empty">No image</div>
+          <div class="stream-grid">
+            ${{streamEntries(arm).map(stream => `
+              <div class="stream">
+                <div class="stream-title">${{stream.label}}</div>
+                <div class="image-wrap" id="imageWrap-${{idx}}-${{stream.key}}">
+                  <img id="image-${{idx}}-${{stream.key}}" class="hidden" alt="">
+                  <div id="empty-${{idx}}-${{stream.key}}" class="empty">No image</div>
+                </div>
+              </div>
+            `).join("") || `
+              <div class="stream">
+                <div class="stream-title">Image</div>
+                <div class="image-wrap">
+                  <div class="empty">No image</div>
+                </div>
+              </div>
+            `}}
           </div>
           <div class="readout">
             <div class="label">pose</div><div id="pose-${{idx}}">[]</div>
@@ -521,48 +668,13 @@ def _html_template(metadata):
       document.getElementById("timeSummary").textContent =
         `t=${{fmt(elapsed, 3)}}s / ${{fmt(ep.durationSec, 3)}}s`;
       ep.arms.forEach((arm, idx) => {{
-        const img = document.getElementById(`image-${{idx}}`);
-        const empty = document.getElementById(`empty-${{idx}}`);
-        const url = arm.images ? arm.images[state.frame] : null;
-        if (url) {{
-          const requestedFrame = state.frame;
-          if (img.dataset.currentSrc) {{
-            empty.classList.add("hidden");
-          }} else {{
-            empty.textContent = "Loading image";
-            empty.classList.remove("hidden");
-          }}
-          if (img.dataset.currentSrc === url) {{
-            img.alt = `${{arm.name}} frame ${{requestedFrame}}`;
-            img.classList.remove("hidden");
-            empty.classList.add("hidden");
-          }} else {{
-            img.dataset.pendingSrc = url;
-            const loader = new Image();
-            loader.onload = () => {{
-              if (img.dataset.pendingSrc !== url) return;
-              img.src = url;
-              img.alt = `${{arm.name}} frame ${{requestedFrame}}`;
-              img.dataset.currentSrc = url;
-              img.classList.remove("hidden");
-              empty.classList.add("hidden");
-            }};
-            loader.onerror = () => {{
-              if (img.dataset.pendingSrc !== url || img.dataset.currentSrc) return;
-              img.classList.add("hidden");
-              empty.textContent = "Image failed";
-              empty.classList.remove("hidden");
-            }};
-            loader.src = url;
-          }}
-        }} else {{
-          img.dataset.pendingSrc = "";
-          img.dataset.currentSrc = "";
-          img.removeAttribute("src");
-          img.classList.add("hidden");
-          empty.textContent = "No image";
-          empty.classList.remove("hidden");
-        }}
+        streamEntries(arm).forEach(stream => {{
+          const img = document.getElementById(`image-${{idx}}-${{stream.key}}`);
+          const empty = document.getElementById(`empty-${{idx}}-${{stream.key}}`);
+          if (!img || !empty) return;
+          const url = stream.urls ? stream.urls[state.frame] : null;
+          renderImageSlot(img, empty, url, `${{arm.name}} ${{stream.label}} frame ${{state.frame}}`);
+        }});
         const pose = arm.pose ? arm.pose[state.frame] : [];
         const gripper = arm.gripper ? arm.gripper[state.frame] : [];
         const poseEl = document.getElementById(`pose-${{idx}}`);

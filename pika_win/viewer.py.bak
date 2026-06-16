@@ -14,11 +14,8 @@ mode='none' 이면 NullViewer(모든 호출 no-op, rerun import 조차 안 함).
 """
 import logging
 import os
-import signal
 import socket
 import subprocess
-import sys
-import threading
 import time
 from urllib.parse import quote
 
@@ -74,89 +71,6 @@ def _listening_tcp_ports_for_self():
     except OSError:
         pass
     return ports
-
-
-def _pids_listening_on(port):
-    """주어진 TCP 포트를 LISTEN(0A) 중인 프로세스 PID 목록(Linux, 같은 유저)."""
-    target_inodes = set()
-    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
-        try:
-            with open(path, encoding="ascii") as f:
-                next(f, None)
-                for line in f:
-                    cols = line.split()
-                    if len(cols) < 10 or cols[3] != "0A":
-                        continue
-                    _, port_hex = cols[1].split(":")
-                    if int(port_hex, 16) == port:
-                        target_inodes.add(cols[9])
-        except OSError:
-            continue
-    if not target_inodes:
-        return []
-    pids = []
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit():
-            continue
-        fd_dir = f"/proc/{pid}/fd"
-        try:
-            for name in os.listdir(fd_dir):
-                try:
-                    target = os.readlink(os.path.join(fd_dir, name))
-                except OSError:
-                    continue
-                if target.startswith("socket:[") and target[8:-1] in target_inodes:
-                    pids.append(int(pid))
-                    break
-        except OSError:
-            continue
-    return pids
-
-
-def _reap_stale_viewer_port(port):
-    """시작 시 preferred 포트(예: 9876)를 잡고 있는 '이전 뷰어 좀비'를 정리.
-
-    rerun serve_grpc 데드락 등으로 남은 collect.py/rerun/pika_view 프로세스만 대상.
-    자기 자신/무관 프로세스는 건드리지 않는다. Linux 전용(그 외 no-op).
-    """
-    if not sys.platform.startswith("linux"):
-        return
-    me = os.getpid()
-    markers = ("collect.py", "pika_view", "serve_grpc", "rerun")
-    killed = False
-    for pid in _pids_listening_on(port):
-        if pid == me:
-            continue
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
-        except OSError:
-            continue
-        if not any(mk in cmd for mk in markers):
-            continue
-        log.warning("[viewer] 포트 %d 점유 좀비 정리: pid=%d (%s)", port, pid, cmd[:80])
-        killed = True
-        try:
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(1.0)
-            os.kill(pid, signal.SIGKILL)  # 데드락 프로세스는 TERM 무시 → KILL
-        except ProcessLookupError:
-            pass
-        except OSError as e:
-            log.warning("[viewer] 좀비 정리 실패 pid=%d: %s", pid, e)
-    if not killed:
-        return
-    # 커널이 LISTEN 소켓을 실제로 해제할 때까지 폴링(최대 ~2s) → 9876 재확보.
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            probe.bind(("0.0.0.0", port))
-            return
-        except OSError:
-            time.sleep(0.1)
-        finally:
-            probe.close()
 
 
 def _lan_ips():
@@ -263,11 +177,14 @@ class RerunViewer:
         self._send_default_blueprint()
         if mode == "web":
             lan_ips = _lan_ips()
-            _reap_stale_viewer_port(9876)
             gport = _free_port(9876)
             cors_allow_origin = [f"http://{ip}:*" for ip in lan_ips]
             log.info("[viewer] gRPC 서버 시작 중: port=%d mem<=%s", gport, memory_limit)
-            uri = self._serve_grpc_with_watchdog(rr, gport, memory_limit, cors_allow_origin)
+            uri = rr.serve_grpc(
+                grpc_port=gport,
+                server_memory_limit=memory_limit,
+                cors_allow_origin=cors_allow_origin,
+            )
             log.info("[viewer] gRPC 서버 시작 완료: %s", uri)
             before = _listening_tcp_ports_for_self()
             wport = _free_port(9090)
@@ -301,43 +218,10 @@ class RerunViewer:
                 except OSError as e:
                     log.warning("[viewer] URL 파일 저장 실패: %s", e)
         else:  # 'spawn' = 네이티브 창
-            _reap_stale_viewer_port(9876)
             gport = _free_port(9876)
             rr.spawn(port=gport, memory_limit=memory_limit)
             log.info("[viewer] 네이티브 창(spawn) :%d (mem<=%s)", gport, memory_limit)
         rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_UP, static=True)
-
-    @staticmethod
-    def _serve_grpc_with_watchdog(rr, gport, memory_limit, cors_allow_origin, timeout=10.0):
-        """rr.serve_grpc 를 워치독 스레드에서 호출.
-
-        rerun 0.33 의 간헐적 serve_grpc 데드락(포트는 bind 되나 리턴 안 함) 대비.
-        timeout 초 내 리턴이 없으면 무한 대기 대신 즉시 종료(os._exit)하여 재실행 유도.
-        """
-        result = {}
-
-        def _run():
-            try:
-                result["uri"] = rr.serve_grpc(
-                    grpc_port=gport,
-                    server_memory_limit=memory_limit,
-                    cors_allow_origin=cors_allow_origin,
-                )
-            except BaseException as e:  # noqa: BLE001  스레드 내 예외 보존
-                result["err"] = e
-
-        t = threading.Thread(target=_run, name="serve_grpc", daemon=True)
-        t.start()
-        t.join(timeout)
-        if "uri" in result:
-            return result["uri"]
-        if "err" in result:
-            log.error("[viewer] gRPC 서버 시작 실패: %s", result["err"])
-        else:
-            log.error("[viewer] rerun gRPC 데드락 감지 — 종료합니다. 다시 실행하세요")
-        # 데드락 스레드는 native 호출에 묶여 정상 종료가 멈출 수 있어 즉시 종료.
-        sys.stderr.flush()
-        os._exit(1)
 
     def _send_default_blueprint(self):
         """Start with color/color/world visible; keep diagnostics available but hidden."""

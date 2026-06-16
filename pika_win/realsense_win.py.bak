@@ -2,8 +2,6 @@
 
 color(BGR8) + depth(Z16, color에 정렬) 스트림. Windows 네이티브 동작.
 """
-import os
-import re
 import threading
 import time
 
@@ -11,30 +9,13 @@ import numpy as np
 import pyrealsense2 as rs
 
 
-def _default_advanced_json():
-    """수집·추론이 동일 카메라 세팅을 쓰도록 하는 rs400 advanced-mode JSON 경로.
-
-    우선순위: 인자 > 환경변수 PIKA_REALSENSE_JSON > repo 내 config 기본 파일.
-    파일이 없으면 None(=미적용, 드라이버 기본값 유지).
-    """
-    env = os.environ.get("PIKA_REALSENSE_JSON")
-    if env:
-        return env
-    repo_default = os.path.join(
-        os.path.dirname(__file__), "..", "config", "realsense_d405_advanced.json"
-    )
-    return repo_default if os.path.isfile(repo_default) else None
-
-
 class RealSenseD4xx:
-    def __init__(self, serial=None, width=640, height=480, fps=30, align_to_color=True,
-                 json_path=None):
+    def __init__(self, serial=None, width=640, height=480, fps=30, align_to_color=True):
         self.serial = serial
         self.width = width
         self.height = height
         self.fps = fps
         self.align_to_color = align_to_color
-        self.json_path = json_path if json_path is not None else _default_advanced_json()
         self.pipe = None
         self.align = None
         self.physical_port = None
@@ -46,80 +27,7 @@ class RealSenseD4xx:
         self._running = False
         self._thread = None
 
-    def _apply_advanced_json(self):
-        """pipeline start 전에 advanced-mode JSON을 디바이스에 적용.
-
-        실패해도 캡처 자체는 계속(드라이버 기본값으로 폴백). JSON에
-        controls-autoexposure-auto=True가 들어있으면 노출은 그대로 auto 유지.
-        """
-        path = self.json_path
-        if not path:
-            return
-        if not os.path.isfile(path):
-            print(f"[RealSense] advanced json 없음, 건너뜀: {path}")
-            return
-        try:
-            with open(path, "r") as f:
-                json_str = f.read()
-        except Exception as e:
-            print(f"[RealSense] advanced json 읽기 실패({path}): {e}")
-            return
-
-        def _find_dev():
-            ctx = rs.context()
-            for d in ctx.query_devices():
-                sn = d.get_info(rs.camera_info.serial_number)
-                if self.serial is None or str(sn) == str(self.serial):
-                    return d
-            return None
-
-        try:
-            dev = _find_dev()
-            if dev is None:
-                print(f"[RealSense] advanced json: serial={self.serial} 디바이스 미발견, 건너뜀")
-                return
-            adv = rs.rs400_advanced_mode(dev)
-            tries = 0
-            while not adv.is_enabled() and tries < 5:
-                adv.toggle_advanced_mode(True)
-                time.sleep(5)  # advanced mode 토글은 USB 재열거를 유발 → 재획득
-                dev = _find_dev()
-                if dev is None:
-                    break
-                adv = rs.rs400_advanced_mode(dev)
-                tries += 1
-            adv.load_json(json_str)
-            print(f"[RealSense] advanced json 적용 완료 serial={self.serial}: {path}")
-            self._enforce_depth_units(dev, json_str)
-        except Exception as e:
-            print(f"[RealSense] advanced json 적용 실패 serial={self.serial}: {e}")
-
-    def _enforce_depth_units(self, dev, json_str):
-        """depth_units(=depth scale, m/LSB)를 JSON의 param-depthunits로 강제 적용.
-
-        D405 펌웨어에서 load_json 은 param-depthunits 를 무시하고 depth-table 의
-        이전 값을 유지하므로, JSON 을 단일 소스로 유지하기 위해 RS2_OPTION_DEPTH_UNITS
-        를 직접 설정한다. advanced param-depthunits 는 마이크로미터 단위.
-        예) 100 -> 100e-6 m = 0.1mm/LSB -> max range 65535*0.1mm ≈ 6.55m.
-        """
-        m = re.search(r'"param-depthunits"\s*:\s*"?(\d+(?:\.\d+)?)"?', json_str)
-        if not m:
-            return
-        depth_units_m = float(m.group(1)) * 1e-6
-        try:
-            sensor = dev.first_depth_sensor()
-            if not sensor.supports(rs.option.depth_units):
-                return
-            rng = sensor.get_option_range(rs.option.depth_units)
-            val = min(max(depth_units_m, rng.min), rng.max)
-            sensor.set_option(rs.option.depth_units, val)
-            print(f"[RealSense] depth_units={val} m (param-depthunits={m.group(1)}µm, "
-                  f"max range≈{val * 65535:.3f} m) serial={self.serial}")
-        except Exception as e:
-            print(f"[RealSense] depth_units 설정 실패 serial={self.serial}: {e}")
-
     def connect(self):
-        self._apply_advanced_json()
         self.pipe = rs.pipeline()
         cfg = rs.config()
         if self.serial:

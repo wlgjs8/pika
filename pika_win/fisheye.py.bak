@@ -21,28 +21,15 @@ log = logging.getLogger("pika.fisheye")
 
 
 def _hub_of(port):
-    """RealSense physical_port / by-path 문자열에서 USB 루트 허브 포트 번호 추출.
+    """RealSense physical_port / by-path 문자열에서 USB 허브 번호(예: '10') 추출.
 
-    버스 번호(usb1/usb2/...)에 무관하게 루트 포트를 뽑는다.
-    physical_port(sysfs): '/sys/.../usb2/2-3/2-3.2/...'   -> '3'
-    legacy(usb1):         '/sys/.../usb1/1-10/1-10.2/...'  -> '10'
-    by-path:              'pci-...-usb-0:10.1:1.0-video...' -> '10'
+    RealSense physical_port: '/sys/.../usb1/1-10/1-10.2/...'  -> '10'
+    by-path:                 'pci-...-usb-0:10.1:1.0-video...' -> '10'
     """
     if not port:
         return None
-    # sysfs: 'usb<bus>/<bus>-<rootport>[/...]' (예: usb2/2-3 -> '3')
-    m = re.search(r"usb\d+/\d+-(\d+)", port)
-    if m:
-        return m.group(1)
-    # '<bus>-<rootport>.' (예: 1-10.2, 2-3.2)
-    m = re.search(r"(?:^|[/-])\d+-(\d+)\.", port)
-    if m:
-        return m.group(1)
-    # by-path video link: 'usb-0:<rootport>.<...>'
-    m = re.search(r"usb-0:(\d+)\.", port)
-    if m:
-        return m.group(1)
-    return None
+    m = re.search(r"(?:^|[/-])1-(\d+)\.", port) or re.search(r"usb-0:(\d+)\.", port)
+    return m.group(1) if m else None
 
 
 def _v4l_name(dev):
