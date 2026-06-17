@@ -16,7 +16,7 @@ HDF5 레이아웃:
            + attrs realsense_sn
   [BIMANUAL] observations/<arm>/pose,gripper,command,images/{...},action  (팔마다)
            + 그룹 attrs realsense_sn, tracker_sn
-  이미지: realsense_color=JPEG, realsense_depth=PNG16, fisheye_color=JPEG (vlen-u8)
+  이미지: realsense_color=PNG, realsense_depth=PNG16, fisheye_color=PNG (vlen-u8)
   action [.,8] = pose(7) + gripper_distance(1)  (v1=관측 미러)
 """
 import logging
@@ -76,6 +76,7 @@ class EpisodeRecorder:
         self.arms_cfg = list(arms)
         self.record_hz = record_hz
         self.jpeg_quality = jpeg_quality
+        self.png_compression = 1
         self.flags = dict(pose=use_pose, sense=use_sense, realsense=use_realsense,
                           fisheye=use_fisheye)
         self.settle = settle
@@ -240,10 +241,11 @@ class EpisodeRecorder:
         return len(self.active)
 
     # ---------------- encoding helpers ----------------
-    def _jpg(self, frame):
+    def _png_color(self, frame):
         if frame is None:
             return np.zeros((0,), np.uint8)
-        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+        ok, buf = cv2.imencode(
+            ".png", frame, [int(cv2.IMWRITE_PNG_COMPRESSION), self.png_compression])
         return buf.reshape(-1) if ok else np.zeros((0,), np.uint8)
 
     def _png16(self, depth):
@@ -296,12 +298,12 @@ class EpisodeRecorder:
         # camera (RealSense color+depth)
         if io.rs is not None:
             c, d, _ = io.rs.get_frames()
-            arm["realsense_color"] = self._jpg(c)
+            arm["realsense_color"] = self._png_color(c)
             arm["realsense_depth"] = self._png16(d)
-        # 어안 카메라(raw fisheye → JPEG)
+        # 어안 카메라(raw fisheye → PNG)
         if io.fisheye is not None:
             fc, _ = io.fisheye.get_frame()
-            arm["fisheye_color"] = self._jpg(fc)
+            arm["fisheye_color"] = self._png_color(fc)
         return arm
 
     def read_frame(self):
@@ -326,7 +328,7 @@ class EpisodeRecorder:
             ds = img.create_dataset(key, (len(frames),), dtype=vlen)
             for i, fr in enumerate(frames):
                 ds[i] = fr["arms"][ai][key]
-            ds.attrs["encoding"] = "png16" if key.endswith("depth") else "jpeg"
+            ds.attrs["encoding"] = "png16" if key.endswith("depth") else "png"
 
         _vds("realsense_color")
         _vds("realsense_depth")

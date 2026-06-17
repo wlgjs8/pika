@@ -216,7 +216,7 @@ conda run --no-capture-output -n pika python scripts/inspect_hdf5.py data/data_Y
 
 - 단일팔: `observations/{pose,gripper,command,images/...}`, 최상위 `action`, `timestamp`
 - 양팔: `observations/<arm>/{pose,gripper,command,images/...,action}`(팔마다), 최상위 `timestamp`
-- 이미지(vlen-u8): `realsense_color`=JPEG, `realsense_depth`=PNG16, `fisheye_color`=JPEG
+- 이미지(vlen-u8): `realsense_color`=PNG, `realsense_depth`=PNG16, `fisheye_color`=PNG
 
 ### 카메라 캘리브레이션 (`camera_calib`)
 

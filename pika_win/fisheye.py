@@ -6,7 +6,7 @@ by-id 로 구분 불가 → RealSense 와 같은 USB 허브에 물려 있다는 
 by-path(USB 포트)로 팔에 매핑한다(resolve_fisheye_node 참조).
 
 전송은 MJPG(저대역폭, 같은 허브의 RealSense 와 USB 대역폭 경합 최소화),
-저장은 recorder 에서 BGR 디코드 후 JPEG 재인코딩(RealSense color 와 동일 경로).
+저장은 recorder 에서 BGR 디코드 후 PNG 무손실 인코딩(RealSense color 와 동일 경로).
 """
 import glob
 import logging

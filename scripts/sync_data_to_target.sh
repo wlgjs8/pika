@@ -12,15 +12,15 @@ Required in .env or environment:
   PASSWD='target_pc_password'
 
 Optional in .env or environment:
-  TARGET_IP=172.28.60.12
+  TARGET_IP=192.168.8.50
   TARGET_USER=plaif
   SOURCE_DIR=./data/
-  TARGET_DIR=/home/plaif/workspace/robotics_lab/data/
+  TARGET_DIR=/data/pika/bolt/data/
 
 Examples:
   ./scripts/sync_data_to_target.sh
-  ./scripts/sync_data_to_target.sh 192.168.8.8
-  TARGET_IP=192.168.8.8 ./scripts/sync_data_to_target.sh
+  ./scripts/sync_data_to_target.sh 192.168.8.50
+  TARGET_IP=192.168.8.50 ./scripts/sync_data_to_target.sh
   DRY_RUN=1 ./scripts/sync_data_to_target.sh
 EOF
 }
@@ -57,10 +57,10 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-TARGET_IP="${ARG_TARGET_IP:-${ENV_TARGET_IP:-${TARGET_IP:-172.28.60.12}}}"
+TARGET_IP="${ARG_TARGET_IP:-${ENV_TARGET_IP:-${TARGET_IP:-192.168.8.50}}}"
 TARGET_USER="${ENV_TARGET_USER:-${TARGET_USER:-plaif}}"
 SOURCE_DIR="${ENV_SOURCE_DIR:-${SOURCE_DIR:-./data/}}"
-TARGET_DIR="${ENV_TARGET_DIR:-${TARGET_DIR:-/home/plaif/workspace/robotics_lab/data/}}"
+TARGET_DIR="${ENV_TARGET_DIR:-${TARGET_DIR:-/data/pika/bolt/data/}}"
 PASSWD="${ENV_PASSWD:-${PASSWD:-}}"
 DRY_RUN="${ENV_DRY_RUN:-${DRY_RUN:-0}}"
 

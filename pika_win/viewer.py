@@ -7,7 +7,7 @@
 양팔이면 양쪽 데이터가 동시에 보인다.
 
 메모리: 뷰어 memory_limit 으로 라이브 스트림만 유지(상한 초과 시 오래된 데이터 폐기).
-이미지는 인코딩 바이트(JPEG/PNG)를 rr.EncodedImage 로 그대로 전송(디코딩/재인코딩 0),
+이미지는 인코딩 바이트(PNG)를 rr.EncodedImage 로 그대로 전송(디코딩/재인코딩 0),
 img_every 프레임마다만 로깅.
 
 mode='none' 이면 NullViewer(모든 호출 no-op, rerun import 조차 안 함).
@@ -436,13 +436,13 @@ class RerunViewer:
         rr = self.rr
         rc = arm.get("realsense_color")
         if rc is not None and rc.size > 0:
-            rr.log(f"camera/{name}/d405_color", rr.EncodedImage(contents=rc.tobytes(), media_type="image/jpeg"))
+            rr.log(f"camera/{name}/d405_color", rr.EncodedImage(contents=rc.tobytes(), media_type="image/png"))
         rd = arm.get("realsense_depth")
         if rd is not None and rd.size > 0:
             rr.log(f"camera/{name}/d405_depth", rr.EncodedImage(contents=rd.tobytes(), media_type="image/png"))
         fc = arm.get("fisheye_color")
         if fc is not None and fc.size > 0:
-            rr.log(f"camera/{name}/fisheye_color", rr.EncodedImage(contents=fc.tobytes(), media_type="image/jpeg"))
+            rr.log(f"camera/{name}/fisheye_color", rr.EncodedImage(contents=fc.tobytes(), media_type="image/png"))
 
     def close(self):
         pass
