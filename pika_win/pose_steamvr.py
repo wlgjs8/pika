@@ -108,6 +108,19 @@ def quat_rotate_vec(q, v):
     )
 
 
+# OpenVR ETrackingResult 코드 → 사람이 읽는 이름. Running_OK(200) 만 정상 추적.
+# 그 외(특히 201 OutOfRange / 300 Fallback)는 pose 가 valid 로 보여도 추적을
+# 사실상 놓친 상태 → pose 값이 얼어붙는 원인.
+TRACKING_RESULT_NAMES = {
+    1: "Uninitialized",
+    100: "Calibrating_InProgress",
+    101: "Calibrating_OutOfRange",
+    200: "Running_OK",
+    201: "Running_OutOfRange",
+    300: "Fallback_RotationOnly",
+}
+
+
 class PoseSteamVR:
     def __init__(self, target_hz=250.0,
                  origin=openvr.TrackingUniverseStanding,
@@ -153,12 +166,22 @@ class PoseSteamVR:
                     sn = self.vr.getStringTrackedDeviceProperty(i, openvr.Prop_SerialNumber_String)
                 except Exception:
                     sn = "dev%d" % i
+                # eTrackingResult: bPoseIsValid 가 True 라도 추적 품질이 떨어지면
+                # SteamVR 은 마지막/예측 pose 를 유지(Running_OutOfRange/Fallback)한다.
+                # 이 값으로 "pose 정지 = 트래커 추적 손실" vs "사용자가 손을 가만히 둠"
+                # (둘 다 Running_OK) 을 구분한다. 200=Running_OK, 201=Running_OutOfRange,
+                # 300=Fallback_RotationOnly (TRACKING_RESULT_NAMES 참조).
+                try:
+                    tr = int(p.eTrackingResult)
+                except Exception:
+                    tr = -1
                 snap[sn] = {
                     "device_name": sn,
                     "timestamp": ts,
                     "position": [pos[0], pos[1], pos[2]],
                     "rotation": [quat[0], quat[1], quat[2], quat[3]],
                     "valid": True,
+                    "tracking_result": tr,
                 }
             with self._lock:
                 self._latest = snap

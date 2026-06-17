@@ -268,13 +268,19 @@ class EpisodeRecorder:
         arm = {}
         # pose (이 팔의 트래커)
         p = [np.nan] * 7
+        tr = None        # eTrackingResult (추적 품질) — 멈춤이 트래커 손실인지 판별용
+        pose_ts = None   # pose source(폴링 스레드)가 이 트래커를 마지막 갱신한 시각
         if self.pose is not None:
             pd = self.pose.get_pose(io.tracker_sn) if io.tracker_sn else self.pose.get_pose()
             if isinstance(pd, dict) and pd and "position" not in pd:
                 pd = next(iter(pd.values()), None)
             if pd and pd.get("valid"):
                 p = list(pd["position"]) + list(pd["rotation"])
+                tr = pd.get("tracking_result")
+                pose_ts = pd.get("timestamp")
         arm["pose"] = p
+        arm["tracking_result"] = tr
+        arm["pose_ts"] = pose_ts
         # gripper + command
         ga = gd = np.nan
         cs = -1
