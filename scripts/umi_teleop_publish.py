@@ -126,6 +126,12 @@ class PacketLogger:
                 stalls.append(f"{n[0].upper()}{int((perf_now - seen[1]) * 1000)}ms")
         if stalls:
             trk += "  posestall=" + ",".join(stalls) + " [POSESTALL]"
+        # 포즈 중복(같은 샘플 재독): pose_fresh=False 인 side. grep '\[DUP\]' 로
+        # "발행레이트>트래커 갱신레이트라 같은 pose 가 반복 송신된" 순간을 찾는다.
+        # (posestall=폴링 스레드 정지, dup=값 미갱신 — 서로 다른 현상)
+        dups = [n for n in active if packet.get(n, {}).get("pose_fresh") is False]
+        if dups:
+            trk += "  dup=" + ",".join(n[0].upper() for n in dups) + " [DUP]"
         self.fh.write(
             f"{wall}  dt_ms={dt_ms:7.2f}  mono={packet.get('t', 0.0):.6f}  "
             f"sides={','.join(active) or '-'}  deadman={dead}{gap}{trk}  "
@@ -186,12 +192,23 @@ def build_packet(t, sides):
         tr = s.get("tracking_result")
         if isinstance(tr, int):
             entry["tracking_result"] = tr
-        # pose_ts: pose source(폴링 스레드)가 이 트래커를 마지막 갱신한 time.time().
-        # pose 값이 정지해도 ts 가 advance 하면 스레드 live(손 가만히), ts 가 frozen
-        # 이면 폴링 스레드/openvr stall (= 진짜 freeze).
+        # pose_ts: pose source(폴링 스레드)가 이 트래커를 마지막 '폴링' 한 time.time().
+        # 폴 시각이라 값이 멈춰도 advance 한다 → 폴링 스레드 live 판별엔 쓰되,
+        # "중복 샘플" 판별엔 못 쓴다(그건 pose_seq 로).
         pts = s.get("pose_ts")
         if isinstance(pts, (int, float)) and math.isfinite(pts):
             entry["pose_ts"] = float(pts)
+        # 중복(같은 샘플 재독) 신호. dedup 활성 시 main 이 채운다:
+        #   pose_seq   = 값 변화 시에만 증가하는 시퀀스(소스에서 전달)
+        #   pose_fresh = 직전 '송신' 대비 이 side 의 pose_seq 가 전진했는지
+        # 수신측은 pose_fresh=False 면 pose 를 '새 측정' 으로 쓰지 말고 Hold
+        # (deadman/gripper 는 그대로 적용). 모르는 키는 무시되므로 구 수신기 무영향.
+        seq = s.get("pose_seq")
+        if isinstance(seq, int):
+            entry["pose_seq"] = seq
+        pf = s.get("pose_fresh")
+        if pf is not None:
+            entry["pose_fresh"] = bool(pf)
         packet[name] = entry
     return packet
 
@@ -276,14 +293,20 @@ class PedalClutch:
     EV_KEY = 0x01
     EVENT = struct.Struct("llHHi")  # input_event: timeval(2 long) + type + code + value
 
-    def __init__(self, device="auto", toggle=False):
+    def __init__(self, device="auto", toggle=False, debounce_sec=0.05):
         self.device_arg = device
         self.toggle = bool(toggle)
+        self.debounce_sec = max(0.0, float(debounce_sec))
         self.fd = None
         self.path = None
-        self.held = False        # momentary: 발판 눌림 상태
+        self.held = False        # momentary: 발판 눌림 상태(디바운스 후 committed)
         self.engaged_both = False  # toggle: 누적 상태
         self.quit = False        # 인터페이스 호환(발판엔 종료 키 없음)
+        # 접점 바운스 제거: raw 키 상태가 debounce_sec 동안 안정될 때만 commit.
+        # 격한/빠른 모션의 진동이 spurious press/release edge 를 내도 한 번의
+        # 논리 edge 로 합쳐져 deadman 이 떨리지 않는다.
+        self._raw_held = False
+        self._last_edge_mono = 0.0
 
     def _resolve_device(self):
         if self.device_arg not in ("auto", ""):
@@ -305,7 +328,9 @@ class PedalClutch:
         return self
 
     def update(self):
-        # 쌓인 이벤트를 모두 소비해 상태 갱신
+        now = time.monotonic()
+        # 쌓인 이벤트를 모두 소비해 raw 키 상태 갱신(바운스 edge 포함).
+        # raw 가 바뀔 때마다 _last_edge_mono 를 갱신 → 바운스 동안엔 계속 리셋.
         while True:
             try:
                 data = os.read(self.fd, self.EVENT.size * 64)
@@ -320,12 +345,20 @@ class PedalClutch:
                 _, _, etype, _code, value = self.EVENT.unpack_from(data, off)
                 if etype != self.EV_KEY:
                     continue
-                if value == 1:      # 누름
-                    self.held = True
-                    if self.toggle:
-                        self.engaged_both = not self.engaged_both
-                elif value == 0:    # 뗌
-                    self.held = False
+                if value == 1 and not self._raw_held:      # 누름 edge
+                    self._raw_held = True
+                    self._last_edge_mono = now
+                elif value == 0 and self._raw_held:        # 뗌 edge
+                    self._raw_held = False
+                    self._last_edge_mono = now
+                # value==2(오토리피트)·동일값 반복은 무시
+        # raw 상태가 debounce_sec 동안 안정되면 commit. toggle 은 commit 된
+        # 누름 edge(상승)에서만 누적 상태를 뒤집는다 → 바운스로 인한 다중 토글 제거.
+        if self._raw_held != self.held and (now - self._last_edge_mono) >= self.debounce_sec:
+            pressed_edge = self._raw_held and not self.held
+            self.held = self._raw_held
+            if self.toggle and pressed_edge:
+                self.engaged_both = not self.engaged_both
         on = self.engaged_both if self.toggle else self.held
         return {"left": on, "right": on}
 
@@ -432,7 +465,13 @@ def get_arguments():
                     help="robotics_lab(수신) 호스트 IP")
     ap.add_argument("--left-port", type=int, default=50380)
     ap.add_argument("--right-port", type=int, default=50381)
-    ap.add_argument("--rate", type=float, default=100.0, help="발행 Hz")
+    ap.add_argument("--rate", type=float, default=200.0, help="발행 Hz")
+    ap.add_argument("--no-dedup-pose", dest="dedup_pose", action="store_false",
+                    help="포즈 중복 표시(pose_fresh) 비활성. 기본 활성: 발행 레이트가 "
+                         "트래커 native 갱신(~120Hz)보다 빨라 같은 pose 가 반복 송신되면 "
+                         "그 패킷의 해당 side 에 pose_fresh=false 를 실어 수신측이 Hold 하게 "
+                         "한다(케이던스/그리퍼/deadman 은 유지). 비활성 시 구 동작(중복 그대로).")
+    ap.set_defaults(dedup_pose=True)
     ap.add_argument("--no-sense", action="store_true", help="Sense(그리퍼) 미연결")
     ap.add_argument("--grip-open", type=float, default=None, help="그리퍼 open 각도(미지정=자동 범위)")
     ap.add_argument("--grip-closed", type=float, default=None, help="그리퍼 closed 각도")
@@ -450,6 +489,9 @@ def get_arguments():
                     help="발판 evdev 경로(기본 auto=/dev/input/by-id/*FootSwitch*event-kbd)")
     ap.add_argument("--pedal-toggle", action="store_true",
                     help="발판을 밟을 때마다 토글(기본은 밟는 동안만 engage하는 momentary)")
+    ap.add_argument("--pedal-debounce-sec", type=float, default=0.05,
+                    help="발판 접점 바운스 제거 창(초, 기본 0.05). raw 키 상태가 이 시간 "
+                         "동안 안정될 때만 반영 → 진동/빠른 모션 중 spurious deadman 토글 방지. 0=비활성")
     ap.add_argument("--start-engaged", action="store_true",
                     help="시작 시 양팔 클러치 ON (키 입력 없이 즉시 추종)")
     ap.add_argument("--gripper-port", type=int, default=50382,
@@ -499,7 +541,8 @@ def main():
         log.info("[umi] 패킷 로그(KST): %s", pkt_log.path)
 
     if a.pedal:
-        clutch = PedalClutch(a.pedal_device, toggle=a.pedal_toggle).start()
+        clutch = PedalClutch(a.pedal_device, toggle=a.pedal_toggle,
+                             debounce_sec=a.pedal_debounce_sec).start()
         mode = "토글(밟을 때마다)" if a.pedal_toggle else "momentary(밟는 동안)"
         log.info("[umi] 발판 클러치: %s  device=%s  (%s)", "ON", clutch.path, mode)
     else:
@@ -513,6 +556,12 @@ def main():
     grange = {n: [a.grip_open, a.grip_closed] for n in SIDES}
     period = 1.0 / a.rate if a.rate > 0 else 0.0
     last_log = 0.0
+    # 포즈 중복(dedup) 상태: side -> 직전에 '송신' 한 pose_seq. 송신 시점 기준으로
+    # 비교해야 발행레이트>갱신레이트 구간의 재독을 정확히 잡는다(소스의 per-poll
+    # fresh 가 아니라 '내가 마지막에 보낸 seq' 와 비교).
+    last_sent_seq = {n: None for n in SIDES}
+    dup_count = {n: 0 for n in SIDES}
+    sent_count = {n: 0 for n in SIDES}
     try:
         while not clutch.quit:
             tick = time.perf_counter()
@@ -542,8 +591,24 @@ def main():
                 sides[out_name] = {"pose": pose, "gripper": gn, "gripper_rad": grip_rad,
                                    "deadman": engaged.get(name, False),
                                    "tracking_result": arm.get("tracking_result"),
-                                   "pose_ts": arm.get("pose_ts")}
+                                   "pose_ts": arm.get("pose_ts"),
+                                   "pose_seq": arm.get("pose_seq")}
 
+            # 각 side 의 pose_seq 가 직전 '송신' 대비 전진했는지로 pose_fresh 결정.
+            # seq 가 없으면(구 소스/무효 pose) fresh=True 로 둬 기존 동작 보존.
+            if a.dedup_pose:
+                for nm, s in sides.items():
+                    seq = s.get("pose_seq")
+                    if isinstance(seq, int):
+                        prev = last_sent_seq.get(nm)
+                        fresh = (prev is None) or (seq != prev)
+                        s["pose_fresh"] = fresh
+                        last_sent_seq[nm] = seq
+                        sent_count[nm] += 1
+                        if not fresh:
+                            dup_count[nm] += 1
+                    else:
+                        s["pose_fresh"] = True
             packet = build_packet(time.monotonic(), sides)
             data = json.dumps(packet).encode("utf-8")
             for tgt in targets:
@@ -555,8 +620,11 @@ def main():
             if a.verbose and now - last_log > 0.5:
                 last_log = now
                 active = [n for n in SIDES if n in packet]
-                log.debug("[umi] eff_pose_hz=%.0f engaged=%s sides=%s",
-                          getattr(rec.pose, "effective_hz", 0.0), engaged, active)
+                dupinfo = " ".join(
+                    f"{n}:{dup_count[n]}/{sent_count[n]}dup" for n in SIDES if sent_count[n]
+                )
+                log.debug("[umi] eff_pose_hz=%.0f engaged=%s sides=%s %s",
+                          getattr(rec.pose, "effective_hz", 0.0), engaged, active, dupinfo)
 
             rem = period - (time.perf_counter() - tick)
             if rem > 0:

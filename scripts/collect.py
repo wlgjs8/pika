@@ -18,9 +18,11 @@ import atexit
 import glob
 import logging
 import os
+import queue
 import signal
 import struct
 import sys
+import threading
 import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -38,6 +40,17 @@ MAX_ARMS = 2  # Vive 양팔
 
 def _raise_keyboard_interrupt(signum, frame):
     raise KeyboardInterrupt
+
+
+def _ignore_shutdown_signals():
+    previous = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, signal.SIG_IGN)
+        except (OSError, ValueError):
+            pass
+    return previous
 
 
 class CollectRunLock:
@@ -111,6 +124,162 @@ class CollectRunLock:
             return False
         except PermissionError:
             return True
+
+
+class EpisodeSaveWorker:
+    """에피소드 HDF5 저장을 단일 worker + bounded queue 로 처리."""
+    def __init__(self, recorder, logger, max_pending=2, status_interval=1.0):
+        self.recorder = recorder
+        self.log = logger
+        self.max_pending = int(max_pending)
+        self.status_interval = float(status_interval)
+        self._lock = threading.Lock()
+        self._queue = queue.Queue(maxsize=self.max_pending)
+        self._idle = threading.Event()
+        self._idle.set()
+        self._active = None
+        self._errors = []
+        self._done_count = 0
+        self._last_status = 0.0
+        self._thread = threading.Thread(target=self._run, name="EpisodeSaveWorker", daemon=False)
+        self._thread.start()
+
+    def pending_count(self):
+        with self._lock:
+            active = 1 if self._active is not None else 0
+        return active + self._queue.qsize()
+
+    def can_start_recording(self):
+        self._raise_if_error()
+        return self.pending_count() < self.max_pending
+
+    def status(self):
+        with self._lock:
+            active = self._active
+            done = self._done_count
+            failed = len(self._errors)
+        queued = list(self._queue.queue)
+        pending = (1 if active is not None else 0) + len(queued)
+        if active is None:
+            active_text = "-"
+        else:
+            start_perf = active.get("save_start_perf", active["enqueue_perf"])
+            elapsed = time.perf_counter() - start_perf
+            active_text = f"episode_{active['ep']:03d} frames={active['frames']} elapsed={elapsed:.1f}s"
+        queued_text = ",".join(f"episode_{item['ep']:03d}" for item in queued)
+        return f"pending={pending} active={active_text} queued=[{queued_text}] done={done} failed={failed}"
+
+    def log_status(self, force=False):
+        now = time.perf_counter()
+        if force or now - self._last_status >= self.status_interval:
+            self._last_status = now
+            self.log.info("[saveq] %s", self.status())
+
+    def _raise_if_error(self):
+        if self._errors:
+            err = self._errors.pop(0)
+            raise RuntimeError(f"[saveq] background save failed: {err}") from err
+
+    def enqueue(self, ep, path, frames, block=True, reason="enqueue"):
+        item = {
+            "ep": ep,
+            "path": path,
+            "frames": len(frames),
+            "frames_obj": frames,
+            "enqueue_perf": time.perf_counter(),
+        }
+        while True:
+            if self.pending_count() >= self.max_pending:
+                if not block:
+                    raise RuntimeError(f"[saveq] queue full: pending={self.pending_count()}")
+                self.log.info("[saveq] enqueue 대기   reason=%s   %s", reason, self.status())
+                time.sleep(self.status_interval)
+                self._raise_if_error()
+                continue
+            try:
+                self._queue.put(item, block=False)
+                self._idle.clear()
+                self.log.info("[saveq] enqueue ep=%03d frames=%d pending=%d path=%s",
+                              ep, item["frames"], self.pending_count(), path)
+                return
+            except queue.Full:
+                # Worker가 아직 active로 가져가지 않은 queued item 수가 limit에 닿은 경우.
+                if not block:
+                    raise RuntimeError(f"[saveq] queue full: pending={self.pending_count()}")
+                self.log.info("[saveq] enqueue 대기   reason=%s   %s", reason, self.status())
+                time.sleep(self.status_interval)
+                self._raise_if_error()
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                self._queue.task_done()
+                return
+            with self._lock:
+                self._active = item
+            try:
+                item["save_start_perf"] = time.perf_counter()
+                self.recorder.write_episode(item["path"], item["frames_obj"])
+                save_elapsed = time.perf_counter() - item["save_start_perf"]
+                queue_elapsed = item["save_start_perf"] - item["enqueue_perf"]
+                fps = item["frames"] / max(save_elapsed, 1e-6)
+                size_mb = os.path.getsize(item["path"]) / (1024 * 1024)
+                self.log.info("[saveq] 완료   ep=%03d frames=%d save_elapsed=%.1fs "
+                              "save_fps=%.1f queue_wait=%.1fs size=%.1fMiB pending=%d path=%s",
+                              item["ep"], item["frames"], save_elapsed, fps,
+                              queue_elapsed, size_mb, self.pending_count(), item["path"])
+                with self._lock:
+                    self._done_count += 1
+            except BaseException as exc:  # noqa: BLE001  background error 전달
+                with self._lock:
+                    self._errors.append(exc)
+                self.log.exception("[saveq] 실패   ep=%03d path=%s", item["ep"], item["path"])
+            finally:
+                item.pop("frames_obj", None)
+                with self._lock:
+                    self._active = None
+                self._queue.task_done()
+                if self.pending_count() == 0:
+                    self._idle.set()
+
+    def wait_idle(self, reason):
+        self.log.info("[saveq] 대기 시작   reason=%s   %s", reason, self.status())
+        while self.pending_count() > 0:
+            self.log_status(force=True)
+            self._idle.wait(timeout=self.status_interval)
+        self.log.info("[saveq] 대기 종료   reason=%s   pending=0", reason)
+        self._raise_if_error()
+
+    def close(self):
+        self.wait_idle("save worker close")
+        self._queue.put(None)
+        self._thread.join(timeout=5.0)
+
+
+def append_timing_gap_record(record_path, episode_idx, episode_path, frames, duration_s, gap_events):
+    if not gap_events:
+        return
+    exists = os.path.exists(record_path)
+    record_dir = os.path.dirname(record_path)
+    if record_dir:
+        os.makedirs(record_dir, exist_ok=True)
+        rel_episode_path = os.path.relpath(episode_path, record_dir)
+    else:
+        rel_episode_path = episode_path
+    max_gap = max(event["dt"] for event in gap_events)
+    gap_detail = ",".join(
+        f"{event['frame_idx']}:{event['dt']:.3f}s" for event in gap_events
+    )
+    with open(record_path, "a", encoding="utf-8") as f:
+        if not exists:
+            f.write("# Episodes with timestamp frame gaps detected during collection.\n")
+            f.write("# frame_idx is the index of the frame after the gap.\n")
+            f.write("episode\tpath\tframes\tduration_s\tgap_count\tmax_gap_s\tgaps\n")
+        f.write(
+            f"episode_{episode_idx:03d}\t{rel_episode_path}\t{len(frames)}\t"
+            f"{duration_s:.3f}\t{len(gap_events)}\t{max_gap:.3f}\t{gap_detail}\n"
+        )
 
 
 def _split(s):
@@ -256,8 +425,12 @@ class KeyboardToggle:
 
     def close(self):
         if self._old_term is not None:
-            self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old_term)
-            self._old_term = None
+            try:
+                self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old_term)
+            except OSError as e:
+                log.warning("[keyboard] terminal restore failed: %s", e)
+            finally:
+                self._old_term = None
 
     def poll_keys(self):
         if not self.enabled:
@@ -400,6 +573,14 @@ def main():
                     help="rerun 라이브 뷰어(뷰 전용): web=브라우저, spawn=네이티브 창, none=끔")
     ap.add_argument("--view-img-every", type=int, default=3, help="뷰어 카메라 로깅 간격(프레임)")
     ap.add_argument("--view-mem", default="2GB", help="뷰어 메모리 상한(초과 시 오래된 데이터 폐기)")
+    ap.add_argument("--save-max-pending", type=int, default=2,
+                    help="저장 worker의 최대 pending 에피소드 수(active 포함). 2=저장 중 1개 + 대기 1개")
+    ap.add_argument("--encode-workers", type=int, default=0,
+                    help="에피소드 저장 시 PNG 인코딩 worker 수. 0=auto, 1~2는 수집 루프 CPU 여유 확보에 유리")
+    ap.add_argument("--png-compression", type=int, default=1,
+                    help="color/fisheye PNG compression level(0~9). 0도 무손실이며 가장 빠르고 파일이 큼")
+    ap.add_argument("--png-depth-compression", type=int, default=-1,
+                    help="depth PNG compression level(0~9). 음수=OpenCV 기본값")
     a = ap.parse_args()
     signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
 
@@ -445,7 +626,14 @@ def main():
                           use_fisheye=not a.no_fisheye,
                           require_pose=a.require_pose,
                           require_all_trackers=a.require_all_trackers,
-                          pose_valid_timeout=a.pose_valid_timeout)
+                          pose_valid_timeout=a.pose_valid_timeout,
+                          png_compression=a.png_compression,
+                          png_depth_compression=(
+                              None if a.png_depth_compression < 0 else a.png_depth_compression),
+                          encode_workers=(None if a.encode_workers <= 0 else a.encode_workers))
+    log.info("[save] max_pending=%d encode_workers=%d png_compression=%d depth_png=%s",
+             max(1, a.save_max_pending), rec.encode_workers, rec.png_compression,
+             "opencv-default" if rec.png_depth_compression is None else rec.png_depth_compression)
     try:
         rec.start()  # ← 트래커 개수로 단일/양팔 자동 결정
 
@@ -468,8 +656,12 @@ def main():
     frames = []
     ep = a.start_index
     saved = 0
+    saveq = EpisodeSaveWorker(rec, log, max_pending=max(1, a.save_max_pending), status_interval=1.0)
     rec_t0 = 0.0
     period = 1.0 / a.hz
+    gap_warn_sec = max(period * 2.5, 0.10)
+    timing_gap_path = os.path.join(session_dir, "timing_gaps.txt")
+    gap_events = []
     last_key_toggle = -1e9
     keyboard = KeyboardToggle("b")
     pedal = PedalToggle("none" if a.no_pedal else a.pedal_device)
@@ -499,6 +691,7 @@ def main():
     log.info("[keyboard] terminal focus 상태에서 'b'를 누르면 REC 시작/정지")
     if pedal.enabled:
         log.info("[pedal] FootSwitch를 밟아도 REC 시작/정지")
+    log.info("[timing] frame gap 기록 파일: %s", timing_gap_path)
     log.info("○ IDLE 대기   next=episode_%03d   saved=%d   (%s = REC 시작)",
              ep, saved, toggle_desc)
     try:
@@ -506,6 +699,7 @@ def main():
             tick = time.perf_counter()
             fr = rec.read_frame()
             now = fr["ts"]
+            started_this_tick = False
 
             # ---- b 키 입력으로 REC 토글. 그리퍼 움직임은 녹화 제어에 사용하지 않는다. ----
             toggled, toggled_by = False, None
@@ -538,44 +732,73 @@ def main():
 
             if toggled:
                 if not recording:
-                    recording, frames, rec_t0 = True, [], now
-                    last_hb = tick
-                    a_min, a_max, nan_run, ang_last = reset_diag()
-                    log.info("● REC 시작   episode_%03d   by=%s   min_record=%.1fs",
-                             ep, toggled_by, a.min_record_sec)
+                    if saveq.can_start_recording():
+                        recording, frames, rec_t0, gap_events = True, [], 0.0, []
+                        started_this_tick = True
+                        last_hb = tick
+                        a_min, a_max, nan_run, ang_last = reset_diag()
+                        log.info("● REC 시작   episode_%03d   by=%s   min_record=%.1fs   saveq=%s",
+                                 ep, toggled_by, a.min_record_sec, saveq.status())
+                    else:
+                        log.info("↳ REC 시작 무시   by=%s   save queue full   %s",
+                                 toggled_by, saveq.status())
                 else:
-                    rec_elapsed = now - rec_t0
+                    rec_elapsed = (now - rec_t0) if rec_t0 > 0.0 else 0.0
                     if rec_elapsed < a.min_record_sec:
                         log.info("↳ REC 정지 무시   elapsed=%.2fs < %.2fs   by=%s",
                                  rec_elapsed, a.min_record_sec, toggled_by)
                     else:
                         recording = False
                         path = os.path.join(session_dir, f"episode_{ep:03d}.hdf5")
-                        rec.write_episode(path, frames)
-                        log.info("■ REC 저장   %s   frames=%d   duration=%.1fs   by=%s",
+                        append_timing_gap_record(timing_gap_path, ep, path, frames, rec_elapsed, gap_events)
+                        if gap_events:
+                            log.warning("[timing] gap episode recorded   episode_%03d   count=%d   file=%s",
+                                        ep, len(gap_events), timing_gap_path)
+                        saveq.enqueue(ep, path, frames, block=True, reason="REC 정지 저장")
+                        log.info("■ REC 저장 enqueue   %s   frames=%d   duration=%.1fs   by=%s",
                                  path, len(frames), rec_elapsed, toggled_by)
                         ep += 1
                         saved += 1
                         frames = []
+                        gap_events = []
                         last_hb = tick
                         a_min, a_max, nan_run, ang_last = reset_diag()
                         log.info("○ IDLE 대기   next=episode_%03d   saved=%d   (%s = REC 시작)",
                                  ep, saved, toggle_desc)
 
             if recording:
-                frames.append(fr)
+                if started_this_tick:
+                    pass
+                else:
+                    if not frames:
+                        rec_t0 = now
+                    else:
+                        dt = now - frames[-1]["ts"]
+                        if dt > gap_warn_sec:
+                            gap_events.append({
+                                "frame_idx": len(frames),
+                                "dt": dt,
+                                "elapsed": (now - rec_t0) if rec_t0 > 0.0 else 0.0,
+                            })
+                            log.warning("[timing] frame gap   episode_%03d   dt=%.3fs   "
+                                        "frames=%d   target_dt=%.3fs",
+                                        ep, dt, len(frames), period)
+                    frames.append(fr)
+            else:
+                saveq.log_status()
 
             # ---- 라이브 뷰어(뷰 전용, 팔별, 비활성 시 no-op) ----
             if viewer.enabled:
                 per_arm = [(names[ai], fr["arms"][ai]["gripper"][0], dets[ai].is_closed) for ai in range(n)]
-                viewer.state(recording, ep, saved, (now - rec_t0) if recording else 0.0, per_arm)
+                viewer_elapsed = (now - rec_t0) if recording and rec_t0 > 0.0 else 0.0
+                viewer.state(recording, ep, saved, viewer_elapsed, per_arm)
                 for ai in range(n):
                     viewer.pose(names[ai], fr["arms"][ai]["pose"], recording)
                     viewer.images(names[ai], fr["arms"][ai])
 
             # ---- REC 진행 로그: 팔별 각도 변동폭 vs 임계 비교(채터/오트리거 진단) ----
             if recording and a.hb > 0 and tick - last_hb >= a.hb:
-                rec_elapsed = now - rec_t0
+                rec_elapsed = (now - rec_t0) if rec_t0 > 0.0 else 0.0
                 log.info("● REC 진행   episode_%03d   t=%.1fs   frames=%d   saved=%d",
                          ep, rec_elapsed, len(frames), saved)
                 for ai in range(n):
@@ -595,11 +818,28 @@ def main():
             if rem > 0:
                 time.sleep(rem)
     except KeyboardInterrupt:
+        log.info("[shutdown] Ctrl-C 감지: 저장 큐 flush 후 종료합니다.")
         if recording and frames:
+            recording = False
             path = os.path.join(session_dir, f"episode_{ep:03d}.hdf5")
-            rec.write_episode(path, frames)
-            log.info("■ (중단) 저장 %s   (%d frames)", path, len(frames))
+            rec_elapsed = (frames[-1]["ts"] - rec_t0) if rec_t0 > 0.0 else 0.0
+            append_timing_gap_record(timing_gap_path, ep, path, frames, rec_elapsed, gap_events)
+            if gap_events:
+                log.warning("[timing] gap episode recorded   episode_%03d   count=%d   file=%s",
+                            ep, len(gap_events), timing_gap_path)
+            saveq.enqueue(ep, path, frames, block=True, reason="중단 저장")
+            log.info("■ (중단) 저장 enqueue %s   (%d frames)", path, len(frames))
+            ep += 1
+            saved += 1
     finally:
+        _ignore_shutdown_signals()
+        try:
+            if saveq.pending_count() > 0:
+                log.info("[shutdown] 저장 대기 중: %s", saveq.status())
+            saveq.close()
+            log.info("[shutdown] 저장 큐 flush 완료")
+        except Exception:
+            log.exception("[saveq] 종료 전 flush 실패")
         log.info("[summary] saved=%d  next=episode_%03d  arms=%s", saved, ep, names)
         for ai in range(n):
             d = dets[ai]

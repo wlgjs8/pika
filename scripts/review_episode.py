@@ -143,6 +143,10 @@ IMAGE_STREAMS = (
     ("realsenseDepth", "realsense_depth", "Depth 0-1000 mm"),
 )
 
+DEFAULT_PREVIEW_MAX_SIDE = 320
+DEFAULT_PREVIEW_JPEG_QUALITY = 65
+DEFAULT_PRELOAD_AHEAD = 1
+
 
 def _depth_raw_to_mm(h5, source_base):
     calib = h5.get(f"{source_base}/camera_calib")
@@ -176,7 +180,29 @@ def _depth_visualization(depth, lut):
     return vis
 
 
-def _write_image_assets(h5, display_arm, source_base, output_dir, asset_prefix, dataset_key):
+def _resize_preview(img, max_side):
+    if img is None or max_side <= 0:
+        return img
+    height, width = img.shape[:2]
+    longer = max(height, width)
+    if longer <= max_side:
+        return img
+    scale = float(max_side) / float(longer)
+    size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    return cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+
+
+def _preview_settings(max_side, jpeg_quality, preload_ahead):
+    return {
+        "format": "jpg",
+        "maxSide": int(max_side),
+        "jpegQuality": int(jpeg_quality),
+        "preloadAhead": int(preload_ahead),
+    }
+
+
+def _write_image_assets(h5, display_arm, source_base, output_dir, asset_prefix, dataset_key,
+                        preview_max_side, preview_jpeg_quality):
     img_group = h5.get(f"{source_base}/images")
     if img_group is None or dataset_key not in img_group:
         return None
@@ -188,7 +214,7 @@ def _write_image_assets(h5, display_arm, source_base, output_dir, asset_prefix, 
     os.makedirs(arm_dir, exist_ok=True)
     urls = []
     is_depth = dataset_key.endswith("depth")
-    ext = ".png" if is_depth or encoding not in ("jpg", "jpeg") else ".jpg"
+    ext = ".jpg"
     raw_to_mm = _depth_raw_to_mm(h5, source_base) if is_depth else 1.0
     depth_lut = _depth_lut(raw_to_mm) if is_depth else None
 
@@ -202,41 +228,48 @@ def _write_image_assets(h5, display_arm, source_base, output_dir, asset_prefix, 
             continue
         name = f"frame_{idx:06d}{ext}"
         path = os.path.join(arm_dir, name)
-        if encoding in ("jpg", "jpeg") and not is_depth:
-            with open(path, "wb") as f:
-                f.write(buf.tobytes())
-            written += 1
-        else:
-            img = _decode_image(buf, encoding)
+        img = _decode_image(buf, encoding)
+        if img is None:
+            urls.append(None)
+            continue
+        if is_depth:
+            img = _depth_visualization(img, depth_lut)
             if img is None:
                 urls.append(None)
                 continue
-            if is_depth:
-                img = _depth_visualization(img, depth_lut)
-                if img is None:
-                    urls.append(None)
-                    continue
-            elif img.dtype == np.uint16:
-                img = cv2.convertScaleAbs(img, alpha=0.03)
-            cv2.imwrite(path, img)
-            written += 1
+        elif img.dtype == np.uint16:
+            img = cv2.convertScaleAbs(img, alpha=0.03)
+        img = _resize_preview(img, preview_max_side)
+        ok = cv2.imwrite(path, img, [int(cv2.IMWRITE_JPEG_QUALITY), int(preview_jpeg_quality)])
+        if not ok:
+            urls.append(None)
+            continue
+        written += 1
         urls.append(posixpath.join("assets", _safe_name(asset_prefix), _safe_name(display_arm), stream_name, name))
     _log(f"wrote {asset_prefix}/{display_arm}/{stream_name}: {written}/{len(ds)} frames in {time.perf_counter() - t0:.1f}s")
     return urls
 
 
-def _write_stream_assets(h5, display_arm, source_base, output_dir, asset_prefix=""):
+def _write_stream_assets(h5, display_arm, source_base, output_dir, asset_prefix="",
+                         preview_max_side=DEFAULT_PREVIEW_MAX_SIDE,
+                         preview_jpeg_quality=DEFAULT_PREVIEW_JPEG_QUALITY):
     streams = {}
     labels = {}
     for stream_id, dataset_key, label in IMAGE_STREAMS:
-        urls = _write_image_assets(h5, display_arm, source_base, output_dir, asset_prefix, dataset_key)
+        urls = _write_image_assets(
+            h5, display_arm, source_base, output_dir, asset_prefix, dataset_key,
+            preview_max_side, preview_jpeg_quality,
+        )
         if urls is not None:
             streams[stream_id] = urls
             labels[stream_id] = label
     return streams, labels
 
 
-def _extract_episode(path, output_dir, swap_arm_images=False, clear_output=True, asset_prefix=None):
+def _extract_episode(path, output_dir, swap_arm_images=False, clear_output=True, asset_prefix=None,
+                     preview_max_side=DEFAULT_PREVIEW_MAX_SIDE,
+                     preview_jpeg_quality=DEFAULT_PREVIEW_JPEG_QUALITY,
+                     preload_ahead=DEFAULT_PRELOAD_AHEAD):
     if clear_output and os.path.exists(output_dir):
         shutil.rmtree(output_dir)
     os.makedirs(os.path.join(output_dir, "assets"), exist_ok=True)
@@ -270,7 +303,9 @@ def _extract_episode(path, output_dir, swap_arm_images=False, clear_output=True,
             image_source_arm = _image_source_arm(arm, arm_names, swap_arm_images)
             image_source_base = _arm_base(h5, image_source_arm)
             streams, stream_labels = _write_stream_assets(
-                h5, arm, image_source_base, output_dir, asset_prefix=asset_prefix
+                h5, arm, image_source_base, output_dir, asset_prefix=asset_prefix,
+                preview_max_side=preview_max_side,
+                preview_jpeg_quality=preview_jpeg_quality,
             )
             pose_valid = int(np.sum(np.isfinite(pose[:, 0]))) if pose.ndim == 2 and pose.shape[0] else 0
             arms.append({
@@ -297,12 +332,16 @@ def _extract_episode(path, output_dir, swap_arm_images=False, clear_output=True,
             "durationSec": float(timestamps[-1] - timestamps[0]) if len(timestamps) > 1 else 0.0,
             "elapsed": [float(t - timestamps[0]) for t in timestamps],
             "attrs": {key: _attr_text(value) for key, value in h5.attrs.items()},
+            "preview": _preview_settings(preview_max_side, preview_jpeg_quality, preload_ahead),
             "arms": arms,
         }
     return metadata
 
 
-def _session_metadata(paths, episodes, build_complete=True, build_error=None):
+def _session_metadata(paths, episodes, build_complete=True, build_error=None,
+                      preview_max_side=DEFAULT_PREVIEW_MAX_SIDE,
+                      preview_jpeg_quality=DEFAULT_PREVIEW_JPEG_QUALITY,
+                      preload_ahead=DEFAULT_PRELOAD_AHEAD):
     session_dir = os.path.dirname(os.path.abspath(paths[0]))
     return {
         "sessionPath": session_dir,
@@ -311,6 +350,7 @@ def _session_metadata(paths, episodes, build_complete=True, build_error=None):
         "readyCount": len(episodes),
         "buildComplete": bool(build_complete),
         "buildError": build_error,
+        "preview": _preview_settings(preview_max_side, preview_jpeg_quality, preload_ahead),
         "episodes": episodes,
     }
 
@@ -324,7 +364,10 @@ def _write_metadata(metadata, output_dir):
     return path
 
 
-def _extract_session_episodes(paths, output_dir, swap_arm_images=False, start_index=1, total_count=None):
+def _extract_session_episodes(paths, output_dir, swap_arm_images=False, start_index=1, total_count=None,
+                              preview_max_side=DEFAULT_PREVIEW_MAX_SIDE,
+                              preview_jpeg_quality=DEFAULT_PREVIEW_JPEG_QUALITY,
+                              preload_ahead=DEFAULT_PRELOAD_AHEAD):
     episodes = []
     total_count = total_count or (start_index + len(paths) - 1)
     for offset, path in enumerate(paths):
@@ -337,11 +380,17 @@ def _extract_session_episodes(paths, output_dir, swap_arm_images=False, start_in
             swap_arm_images=swap_arm_images,
             clear_output=False,
             asset_prefix=stem,
+            preview_max_side=preview_max_side,
+            preview_jpeg_quality=preview_jpeg_quality,
+            preload_ahead=preload_ahead,
         ))
     return episodes
 
 
-def _extract_session(paths, output_dir, swap_arm_images=False):
+def _extract_session(paths, output_dir, swap_arm_images=False,
+                     preview_max_side=DEFAULT_PREVIEW_MAX_SIDE,
+                     preview_jpeg_quality=DEFAULT_PREVIEW_JPEG_QUALITY,
+                     preload_ahead=DEFAULT_PRELOAD_AHEAD):
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
     os.makedirs(os.path.join(output_dir, "assets"), exist_ok=True)
@@ -350,11 +399,22 @@ def _extract_session(paths, output_dir, swap_arm_images=False):
         output_dir,
         swap_arm_images=swap_arm_images,
         total_count=len(paths),
+        preview_max_side=preview_max_side,
+        preview_jpeg_quality=preview_jpeg_quality,
+        preload_ahead=preload_ahead,
     )
-    return _session_metadata(paths, episodes, build_complete=True)
+    return _session_metadata(
+        paths, episodes, build_complete=True,
+        preview_max_side=preview_max_side,
+        preview_jpeg_quality=preview_jpeg_quality,
+        preload_ahead=preload_ahead,
+    )
 
 
-def _extract_session_initial(paths, output_dir, swap_arm_images=False):
+def _extract_session_initial(paths, output_dir, swap_arm_images=False,
+                             preview_max_side=DEFAULT_PREVIEW_MAX_SIDE,
+                             preview_jpeg_quality=DEFAULT_PREVIEW_JPEG_QUALITY,
+                             preload_ahead=DEFAULT_PRELOAD_AHEAD):
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
     os.makedirs(os.path.join(output_dir, "assets"), exist_ok=True)
@@ -363,11 +423,22 @@ def _extract_session_initial(paths, output_dir, swap_arm_images=False):
         output_dir,
         swap_arm_images=swap_arm_images,
         total_count=len(paths),
+        preview_max_side=preview_max_side,
+        preview_jpeg_quality=preview_jpeg_quality,
+        preload_ahead=preload_ahead,
     )
-    return _session_metadata(paths, episodes, build_complete=len(paths) <= 1)
+    return _session_metadata(
+        paths, episodes, build_complete=len(paths) <= 1,
+        preview_max_side=preview_max_side,
+        preview_jpeg_quality=preview_jpeg_quality,
+        preload_ahead=preload_ahead,
+    )
 
 
-def _build_session_remainder(paths, output_dir, metadata, swap_arm_images=False):
+def _build_session_remainder(paths, output_dir, metadata, swap_arm_images=False,
+                             preview_max_side=DEFAULT_PREVIEW_MAX_SIDE,
+                             preview_jpeg_quality=DEFAULT_PREVIEW_JPEG_QUALITY,
+                             preload_ahead=DEFAULT_PRELOAD_AHEAD):
     try:
         for idx, path in enumerate(paths[1:], 2):
             episode = _extract_session_episodes(
@@ -376,6 +447,9 @@ def _build_session_remainder(paths, output_dir, metadata, swap_arm_images=False)
                 swap_arm_images=swap_arm_images,
                 start_index=idx,
                 total_count=len(paths),
+                preview_max_side=preview_max_side,
+                preview_jpeg_quality=preview_jpeg_quality,
+                preload_ahead=preload_ahead,
             )[0]
             metadata["episodes"].append(episode)
             metadata["readyCount"] = len(metadata["episodes"])
@@ -579,6 +653,8 @@ def _html_template(metadata):
     const preloadSeen = new Set();
     const preloadQueue = [];
     const maxPreloadRefs = 96;
+    const previewSettings = DATA.preview || {{}};
+    const preloadAhead = Math.max(0, Number.parseInt(previewSettings.preloadAhead, 10) || 0);
     const streamOrder = ["realsenseColor", "fisheyeColor", "realsenseDepth"];
     const defaultStreamLabels = {{
       realsenseColor: "D405 Color",
@@ -653,7 +729,7 @@ def _html_template(metadata):
 
     function preloadAround(frame) {{
       const ep = currentEpisode();
-      for (let offset = 1; offset <= 2; offset += 1) {{
+      for (let offset = 1; offset <= preloadAhead; offset += 1) {{
         const next = frame + offset;
         if (next >= ep.frameCount) break;
         ep.arms.forEach(arm => {{
@@ -960,6 +1036,12 @@ def main():
                     help="Swap left/right camera images in the review UI for old reversed-camera data")
     ap.add_argument("--no-swap-arm-images", action="store_true",
                     help="Compatibility no-op; arm images are not swapped by default")
+    ap.add_argument("--preview-max-side", type=int, default=DEFAULT_PREVIEW_MAX_SIDE,
+                    help="Maximum long side for generated review JPEG previews; 0 skips final resize")
+    ap.add_argument("--preview-jpeg-quality", type=int, default=DEFAULT_PREVIEW_JPEG_QUALITY,
+                    help="JPEG quality for generated review previews")
+    ap.add_argument("--preload-ahead", type=int, default=DEFAULT_PRELOAD_AHEAD,
+                    help="Number of future frames to preload in the web viewer")
     args = ap.parse_args()
 
     if args.episode:
@@ -980,15 +1062,33 @@ def main():
 
     output_dir = os.path.abspath(args.out) if args.out else default_output_dir
     swap_arm_images = bool(args.swap_arm_images)
+    preview_max_side = max(0, int(args.preview_max_side))
+    preview_jpeg_quality = min(100, max(1, int(args.preview_jpeg_quality)))
+    preload_ahead = max(0, int(args.preload_ahead))
 
     t0 = time.perf_counter()
     worker = None
     if len(paths) == 1:
-        metadata = _extract_episode(paths[0], output_dir, swap_arm_images=swap_arm_images)
+        metadata = _extract_episode(
+            paths[0], output_dir, swap_arm_images=swap_arm_images,
+            preview_max_side=preview_max_side,
+            preview_jpeg_quality=preview_jpeg_quality,
+            preload_ahead=preload_ahead,
+        )
     elif args.no_serve:
-        metadata = _extract_session(paths, output_dir, swap_arm_images=swap_arm_images)
+        metadata = _extract_session(
+            paths, output_dir, swap_arm_images=swap_arm_images,
+            preview_max_side=preview_max_side,
+            preview_jpeg_quality=preview_jpeg_quality,
+            preload_ahead=preload_ahead,
+        )
     else:
-        metadata = _extract_session_initial(paths, output_dir, swap_arm_images=swap_arm_images)
+        metadata = _extract_session_initial(
+            paths, output_dir, swap_arm_images=swap_arm_images,
+            preview_max_side=preview_max_side,
+            preview_jpeg_quality=preview_jpeg_quality,
+            preload_ahead=preload_ahead,
+        )
     html_path = _write_html(metadata, output_dir)
     _write_metadata(metadata, output_dir)
     elapsed = time.perf_counter() - t0
@@ -1009,7 +1109,12 @@ def main():
             worker = threading.Thread(
                 target=_build_session_remainder,
                 args=(paths, output_dir, metadata),
-                kwargs={"swap_arm_images": swap_arm_images},
+                kwargs={
+                    "swap_arm_images": swap_arm_images,
+                    "preview_max_side": preview_max_side,
+                    "preview_jpeg_quality": preview_jpeg_quality,
+                    "preload_ahead": preload_ahead,
+                },
                 daemon=True,
             )
             worker.start()

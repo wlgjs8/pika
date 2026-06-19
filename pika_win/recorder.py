@@ -22,6 +22,7 @@ HDF5 레이아웃:
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -67,6 +68,7 @@ class EpisodeRecorder:
                  use_pose=True, use_sense=True, use_realsense=True, use_fisheye=True,
                  settle=1.0, require_pose=False, require_all_trackers=False,
                  pose_valid_timeout=2.0, pose_tip_frame=False,
+                 png_compression=1, png_depth_compression=None, encode_workers=None,
                  # ---- 레거시 단일-팔 호환 kwargs (arms 미지정 시 사용) ----
                  com_port="COM3", realsense_sn=None):
         self.out_dir = out_dir
@@ -76,7 +78,15 @@ class EpisodeRecorder:
         self.arms_cfg = list(arms)
         self.record_hz = record_hz
         self.jpeg_quality = jpeg_quality
-        self.png_compression = 1
+        self.png_compression = self._clamp_png_compression(png_compression)
+        self.png_depth_compression = (
+            None if png_depth_compression is None
+            else self._clamp_png_compression(png_depth_compression)
+        )
+        if encode_workers is None or int(encode_workers) <= 0:
+            self.encode_workers = max(1, min(8, (os.cpu_count() or 4)))
+        else:
+            self.encode_workers = max(1, int(encode_workers))
         self.flags = dict(pose=use_pose, sense=use_sense, realsense=use_realsense,
                           fisheye=use_fisheye)
         self.settle = settle
@@ -88,6 +98,10 @@ class EpisodeRecorder:
         self.pose_tip_frame = bool(pose_tip_frame)
         self.pose = None
         self.active = []   # list[_ArmIO] — 실제 활성 팔(1 또는 2)
+
+    @staticmethod
+    def _clamp_png_compression(value):
+        return max(0, min(9, int(value)))
 
     # ---------------- lifecycle ----------------
     def start(self):
@@ -251,8 +265,14 @@ class EpisodeRecorder:
     def _png16(self, depth):
         if depth is None:
             return np.zeros((0,), np.uint8)
-        ok, buf = cv2.imencode(".png", depth)
+        params = []
+        if self.png_depth_compression is not None:
+            params = [int(cv2.IMWRITE_PNG_COMPRESSION), self.png_depth_compression]
+        ok, buf = cv2.imencode(".png", depth, params)
         return buf.reshape(-1) if ok else np.zeros((0,), np.uint8)
+
+    def _encode_image(self, key, frame):
+        return self._png16(frame) if key.endswith("depth") else self._png_color(frame)
 
     def read_gripper_angle(self, arm_idx=0):
         """특정 팔의 그리퍼 각도만 빠르게(캘리브/제스처용). 없으면 None."""
@@ -271,7 +291,9 @@ class EpisodeRecorder:
         # pose (이 팔의 트래커)
         p = [np.nan] * 7
         tr = None        # eTrackingResult (추적 품질) — 멈춤이 트래커 손실인지 판별용
-        pose_ts = None   # pose source(폴링 스레드)가 이 트래커를 마지막 갱신한 시각
+        pose_ts = None   # pose source(폴링 스레드)가 이 트래커를 마지막 '폴링' 한 시각
+        pose_seq = None  # 값 변화 시에만 증가 — 중복(같은 샘플 재독) 판별용
+        pose_sample_ts = None  # pose 값이 마지막으로 '바뀐' 시각
         if self.pose is not None:
             pd = self.pose.get_pose(io.tracker_sn) if io.tracker_sn else self.pose.get_pose()
             if isinstance(pd, dict) and pd and "position" not in pd:
@@ -280,9 +302,13 @@ class EpisodeRecorder:
                 p = list(pd["position"]) + list(pd["rotation"])
                 tr = pd.get("tracking_result")
                 pose_ts = pd.get("timestamp")
+                pose_seq = pd.get("sample_seq")
+                pose_sample_ts = pd.get("sample_ts")
         arm["pose"] = p
         arm["tracking_result"] = tr
         arm["pose_ts"] = pose_ts
+        arm["pose_seq"] = pose_seq
+        arm["pose_sample_ts"] = pose_sample_ts
         # gripper + command
         ga = gd = np.nan
         cs = -1
@@ -298,12 +324,12 @@ class EpisodeRecorder:
         # camera (RealSense color+depth)
         if io.rs is not None:
             c, d, _ = io.rs.get_frames()
-            arm["realsense_color"] = self._png_color(c)
-            arm["realsense_depth"] = self._png16(d)
-        # 어안 카메라(raw fisheye → PNG)
+            arm["realsense_color"] = c
+            arm["realsense_depth"] = d
+        # 어안 카메라(raw fisheye → 저장 시 PNG)
         if io.fisheye is not None:
             fc, _ = io.fisheye.get_frame()
-            arm["fisheye_color"] = self._png_color(fc)
+            arm["fisheye_color"] = fc
         return arm
 
     def read_frame(self):
@@ -325,9 +351,12 @@ class EpisodeRecorder:
         def _vds(key):
             if key not in frames[0]["arms"][ai]:
                 return
+            values = [fr["arms"][ai].get(key) for fr in frames]
+            with ThreadPoolExecutor(max_workers=self.encode_workers) as ex:
+                encoded = list(ex.map(lambda frame: self._encode_image(key, frame), values))
             ds = img.create_dataset(key, (len(frames),), dtype=vlen)
-            for i, fr in enumerate(frames):
-                ds[i] = fr["arms"][ai][key]
+            for i, buf in enumerate(encoded):
+                ds[i] = buf
             ds.attrs["encoding"] = "png16" if key.endswith("depth") else "png"
 
         _vds("realsense_color")
@@ -373,39 +402,51 @@ class EpisodeRecorder:
         vlen = h5py.vlen_dtype(np.uint8)
         ts = np.asarray([f["ts"] for f in frames], np.float64)
         eff = len(frames) / max(ts[-1] - ts[0], 1e-6) if len(frames) > 1 else 0.0
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with h5py.File(path, "w") as h:
-            h.attrs["record_hz"] = self.record_hz
-            h.attrs["effective_hz"] = eff
-            # tip frame: 동일 world 에서 포즈 원점만 트래커→그리퍼 팁(공식 변환)으로 이동
-            h.attrs["pose_frame"] = (
-                "steamvr_world_gripper_tip" if self.pose_tip_frame else "steamvr_world")
-            h.attrs["pose_format"] = "x,y,z,qx,qy,qz,qw"
-            h.attrs["n_arms"] = n
-            h.attrs["arm_names"] = ",".join(names)
-            h.create_dataset("timestamp", data=ts)
+        abs_path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        tmp_path = abs_path + ".tmp"
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            with h5py.File(tmp_path, "w") as h:
+                h.attrs["record_hz"] = self.record_hz
+                h.attrs["effective_hz"] = eff
+                # tip frame: 동일 world 에서 포즈 원점만 트래커→그리퍼 팁(공식 변환)으로 이동
+                h.attrs["pose_frame"] = (
+                    "steamvr_world_gripper_tip" if self.pose_tip_frame else "steamvr_world")
+                h.attrs["pose_format"] = "x,y,z,qx,qy,qz,qw"
+                h.attrs["n_arms"] = n
+                h.attrs["arm_names"] = ",".join(names)
+                h.create_dataset("timestamp", data=ts)
 
-            if n == 1:
-                # ---- 기존 평면 레이아웃(하위 호환) ----
-                s = self.active[0].spec if self.active else self.arms_cfg[0]
-                h.attrs["realsense_sn"] = str(s.realsense_sn or "")
-                h.attrs["fisheye_dev"] = str(self.active[0].fisheye_dev or "") if self.active else ""
-                obs = h.create_group("observations")
-                action = self._write_obs(obs, frames, 0, vlen)
-                h.create_dataset("action", data=action)
-                if self.active:
-                    self._write_camera_calib(obs, self.active[0])
-            else:
-                # ---- 양팔: 팔별 그룹 ----
-                for ai, name in enumerate(names):
-                    g = h.create_group(f"observations/{name}")
-                    s = self.active[ai].spec
-                    g.attrs["realsense_sn"] = str(s.realsense_sn or "")
-                    g.attrs["tracker_sn"] = str(self.active[ai].tracker_sn or "")
-                    g.attrs["fisheye_dev"] = str(self.active[ai].fisheye_dev or "")
-                    action = self._write_obs(g, frames, ai, vlen)
-                    g.create_dataset("action", data=action)
-                    self._write_camera_calib(g, self.active[ai])
+                if n == 1:
+                    # ---- 기존 평면 레이아웃(하위 호환) ----
+                    s = self.active[0].spec if self.active else self.arms_cfg[0]
+                    h.attrs["realsense_sn"] = str(s.realsense_sn or "")
+                    h.attrs["fisheye_dev"] = str(self.active[0].fisheye_dev or "") if self.active else ""
+                    obs = h.create_group("observations")
+                    action = self._write_obs(obs, frames, 0, vlen)
+                    h.create_dataset("action", data=action)
+                    if self.active:
+                        self._write_camera_calib(obs, self.active[0])
+                else:
+                    # ---- 양팔: 팔별 그룹 ----
+                    for ai, name in enumerate(names):
+                        g = h.create_group(f"observations/{name}")
+                        s = self.active[ai].spec
+                        g.attrs["realsense_sn"] = str(s.realsense_sn or "")
+                        g.attrs["tracker_sn"] = str(self.active[ai].tracker_sn or "")
+                        g.attrs["fisheye_dev"] = str(self.active[ai].fisheye_dev or "")
+                        action = self._write_obs(g, frames, ai, vlen)
+                        g.create_dataset("action", data=action)
+                        self._write_camera_calib(g, self.active[ai])
+            os.replace(tmp_path, abs_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            raise
         print(f"[rec] 저장 {path}  frames={len(frames)}  arms={n}  eff_hz={eff:.1f}")
         return path
 

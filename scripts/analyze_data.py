@@ -261,6 +261,13 @@ def analyze_episode(path: Path) -> EpisodeInfo:
                     info.duration_s = float(timestamps[-1] - timestamps[0])
                     if info.effective_hz is None and info.duration_s > 0:
                         info.effective_hz = float(info.frames / info.duration_s)
+                    target_hz = info.record_hz or 30.0
+                    gap_threshold = max((1.0 / target_hz) * 2.5, 0.10)
+                    gaps = diffs[np.isfinite(diffs) & (diffs > gap_threshold)]
+                    if gaps.size:
+                        info.warnings.append(
+                            f"gap>{gap_threshold * 1000:.0f}ms n={gaps.size} max={float(np.max(gaps)):.2f}s"
+                        )
 
             arm_groups = detect_arm_groups(h5)
             info.arms = [analyze_arm(name, group) for name, group in arm_groups]
@@ -432,7 +439,9 @@ def episode_rows(episodes: list[EpisodeInfo], max_rows: int) -> list[list[str]]:
     rows = []
     for ep in visible:
         status = "ok" if ep.readable else "error"
-        warn = f"warn:{len(ep.warnings)}" if ep.warnings else ""
+        warn = "; ".join(ep.warnings[:2]) if ep.warnings else ""
+        if len(ep.warnings) > 2:
+            warn += f"; +{len(ep.warnings) - 2}"
         if ep.error:
             warn = ep.error[:48]
         rows.append([

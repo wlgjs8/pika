@@ -136,6 +136,11 @@ class PoseSteamVR:
         self._thread = None
         self._running = False
         self._eff_hz = 0.0           # 실제 달성 폴링 Hz
+        # serial -> {"key": pos+quat, "seq": int, "sample_ts": float}.
+        # 폴링(기본 250Hz)이 트래커 native 갱신(~120Hz)보다 빨라 같은 값이 여러 번
+        # 읽힌다. 값이 '실제로 바뀐' 폴에서만 seq++/sample_ts 갱신 → 다운스트림이
+        # timestamp(=폴 시각)가 아니라 seq 로 "새 측정 vs 중복 재독" 을 구분한다.
+        self._seq = {}
 
     def connect(self):
         self.vr = openvr.init(openvr.VRApplication_Background)
@@ -143,6 +148,24 @@ class PoseSteamVR:
         self._thread = threading.Thread(target=self._loop, name="PoseSteamVR", daemon=True)
         self._thread.start()
         return self
+
+    def _sample_seq(self, sn, pos, quat, ts):
+        """값 변화 기반 샘플 시퀀스 갱신. (seq, sample_ts, fresh) 반환.
+
+        pose 값이 직전 폴과 비트 동일하면(= openvr 가 새 디바이스 데이터 없이
+        캐시/예측 pose 를 반환한 것) seq/sample_ts 동결·fresh=False, 바뀌면
+        seq+1·sample_ts=ts·fresh=True. timestamp(폴 시각)는 정지/중복을 구분
+        못 하므로 다운스트림 중복 판별은 이 seq 를 신뢰한다.
+        """
+        key = (pos[0], pos[1], pos[2], quat[0], quat[1], quat[2], quat[3])
+        prev = self._seq.get(sn)
+        if prev is None or key != prev["key"]:
+            seq = 0 if prev is None else prev["seq"] + 1
+            sample_ts, fresh = ts, True
+        else:
+            seq, sample_ts, fresh = prev["seq"], prev["sample_ts"], False
+        self._seq[sn] = {"key": key, "seq": seq, "sample_ts": sample_ts}
+        return seq, sample_ts, fresh
 
     def _loop(self):
         period = 1.0 / self.target_hz if self.target_hz > 0 else 0.0
@@ -175,6 +198,8 @@ class PoseSteamVR:
                     tr = int(p.eTrackingResult)
                 except Exception:
                     tr = -1
+                # 값 변화 기반 샘플 시퀀스(중복 판별의 신뢰 신호). _sample_seq 참조.
+                seq, sample_ts, fresh = self._sample_seq(sn, pos, quat, ts)
                 snap[sn] = {
                     "device_name": sn,
                     "timestamp": ts,
@@ -182,6 +207,9 @@ class PoseSteamVR:
                     "rotation": [quat[0], quat[1], quat[2], quat[3]],
                     "valid": True,
                     "tracking_result": tr,
+                    "sample_seq": seq,      # 값 변화 시에만 증가(중복 판별용)
+                    "sample_ts": sample_ts, # pose 값이 마지막으로 '바뀐' time.time()
+                    "fresh": fresh,         # 이 폴에서 값이 바뀌었는지(진단용)
                 }
             with self._lock:
                 self._latest = snap

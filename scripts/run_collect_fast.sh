@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 export PIKA_VIEW_LAN_IPS="${PIKA_VIEW_LAN_IPS:-172.28.60.40}"
 
 CONDA_ENV="${CONDA_ENV:-pika}"
-VIEW="${PIKA_VIEW:-web}"
+VIEW="${PIKA_VIEW:-none}"
 CONFIG="${PIKA_CONFIG:-}"
 ARM_NAMES="${PIKA_ARM_NAMES:-right,left}"
 COMS="${PIKA_COMS:-/dev/ttyUSB0,/dev/ttyUSB1}"

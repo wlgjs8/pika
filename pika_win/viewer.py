@@ -7,8 +7,7 @@
 양팔이면 양쪽 데이터가 동시에 보인다.
 
 메모리: 뷰어 memory_limit 으로 라이브 스트림만 유지(상한 초과 시 오래된 데이터 폐기).
-이미지는 인코딩 바이트(PNG)를 rr.EncodedImage 로 그대로 전송(디코딩/재인코딩 0),
-img_every 프레임마다만 로깅.
+이미지는 수집 루프에서 받은 raw frame 을 img_every 프레임마다 preview 인코딩해 전송.
 
 mode='none' 이면 NullViewer(모든 호출 no-op, rerun import 조차 안 함).
 """
@@ -21,6 +20,8 @@ import sys
 import threading
 import time
 from urllib.parse import quote
+
+import cv2
 
 log = logging.getLogger("collect.viewer")
 
@@ -427,7 +428,14 @@ class RerunViewer:
         col = [255, 40, 40] if recording else _ARM_COLORS.get(name, _DEFAULT_COL)
         rr.log(f"world/{name}/trail", rr.LineStrips3D([tr], colors=[col]))
 
-    # ---- 카메라(인코딩 바이트 그대로, img_every 프레임마다) ----
+    @staticmethod
+    def _encoded_image(frame, ext, params=None):
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return None
+        ok, buf = cv2.imencode(ext, frame, params or [])
+        return buf.tobytes() if ok else None
+
+    # ---- 카메라(raw frame → preview 인코딩, img_every 프레임마다) ----
     def images(self, name, arm):
         c = self._fc.get(name, 0) + 1
         self._fc[name] = c
@@ -435,14 +443,17 @@ class RerunViewer:
             return
         rr = self.rr
         rc = arm.get("realsense_color")
-        if rc is not None and rc.size > 0:
-            rr.log(f"camera/{name}/d405_color", rr.EncodedImage(contents=rc.tobytes(), media_type="image/png"))
+        rc_bytes = self._encoded_image(rc, ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if rc_bytes is not None:
+            rr.log(f"camera/{name}/d405_color", rr.EncodedImage(contents=rc_bytes, media_type="image/jpeg"))
         rd = arm.get("realsense_depth")
-        if rd is not None and rd.size > 0:
-            rr.log(f"camera/{name}/d405_depth", rr.EncodedImage(contents=rd.tobytes(), media_type="image/png"))
+        rd_bytes = self._encoded_image(rd, ".png")
+        if rd_bytes is not None:
+            rr.log(f"camera/{name}/d405_depth", rr.EncodedImage(contents=rd_bytes, media_type="image/png"))
         fc = arm.get("fisheye_color")
-        if fc is not None and fc.size > 0:
-            rr.log(f"camera/{name}/fisheye_color", rr.EncodedImage(contents=fc.tobytes(), media_type="image/png"))
+        fc_bytes = self._encoded_image(fc, ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if fc_bytes is not None:
+            rr.log(f"camera/{name}/fisheye_color", rr.EncodedImage(contents=fc_bytes, media_type="image/jpeg"))
 
     def close(self):
         pass
