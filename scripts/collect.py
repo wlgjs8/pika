@@ -15,6 +15,7 @@
 """
 import argparse
 import atexit
+import gc
 import glob
 import logging
 import os
@@ -29,6 +30,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
 from pika_win.recorder import EpisodeRecorder, ArmSpec  # noqa: E402
+from pika_win.episode_writer import EpisodeWriterProcess  # noqa: E402
 from pika_win.gesture import GripperGestureDetector, calibrate_open_closed  # noqa: E402
 from pika_win.sdk_logging import quiet_pika_sdk_info  # noqa: E402
 from pika_win.viewer import make_viewer  # noqa: E402
@@ -127,9 +129,15 @@ class CollectRunLock:
 
 
 class EpisodeSaveWorker:
-    """에피소드 HDF5 저장을 단일 worker + bounded queue 로 처리."""
-    def __init__(self, recorder, logger, max_pending=2, status_interval=1.0):
+    """에피소드 저장을 단일 worker 스레드 + bounded queue 로 처리.
+
+    worker 스레드는 compact(점진 인코딩된) 프레임에서 payload 를 만들고(recorder.build_payload),
+    실제 HDF5 디스크 쓰기는 별도 프로세스(writer)에 위임한 뒤 완료까지 대기한다. 대기 동안
+    GIL 을 놓으므로 수집 루프(메인 스레드)가 30Hz 로 계속 돈다(저장-캡처 GIL/디스크 격리).
+    """
+    def __init__(self, recorder, logger, writer, max_pending=2, status_interval=1.0):
         self.recorder = recorder
+        self.writer = writer
         self.log = logger
         self.max_pending = int(max_pending)
         self.status_interval = float(status_interval)
@@ -220,7 +228,12 @@ class EpisodeSaveWorker:
                 self._active = item
             try:
                 item["save_start_perf"] = time.perf_counter()
-                self.recorder.write_episode(item["path"], item["frames_obj"])
+                # compact 프레임 → payload(인코딩 Future resolve) 후 즉시 원본 참조 해제,
+                # 디스크 쓰기는 writer 프로세스에 위임(완료까지 블록, 대기 중 GIL 해제).
+                payload = self.recorder.build_payload(item["frames_obj"])
+                item["frames_obj"] = None
+                self.writer.write(item["path"], payload)
+                payload = None
                 save_elapsed = time.perf_counter() - item["save_start_perf"]
                 queue_elapsed = item["save_start_perf"] - item["enqueue_perf"]
                 fps = item["frames"] / max(save_elapsed, 1e-6)
@@ -634,6 +647,9 @@ def main():
     log.info("[save] max_pending=%d encode_workers=%d png_compression=%d depth_png=%s",
              max(1, a.save_max_pending), rec.encode_workers, rec.png_compression,
              "opencv-default" if rec.png_depth_compression is None else rec.png_depth_compression)
+    # 하드웨어 스레드(RealSense/pose/fisheye)가 시작되기 전(메인 스레드 단독) 시점에
+    # 디스크 쓰기 전담 writer 프로세스를 fork 로 생성 → fork-after-threads 위험 회피.
+    writer = EpisodeWriterProcess()
     try:
         rec.start()  # ← 트래커 개수로 단일/양팔 자동 결정
 
@@ -650,13 +666,15 @@ def main():
         if viewer is not None:
             viewer.close()
         rec.stop()
+        writer.close()
         raise
 
     recording = False
     frames = []
     ep = a.start_index
     saved = 0
-    saveq = EpisodeSaveWorker(rec, log, max_pending=max(1, a.save_max_pending), status_interval=1.0)
+    saveq = EpisodeSaveWorker(rec, log, writer,
+                              max_pending=max(1, a.save_max_pending), status_interval=1.0)
     rec_t0 = 0.0
     period = 1.0 / a.hz
     gap_warn_sec = max(period * 2.5, 0.10)
@@ -694,10 +712,43 @@ def main():
     log.info("[timing] frame gap 기록 파일: %s", timing_gap_path)
     log.info("○ IDLE 대기   next=episode_%03d   saved=%d   (%s = REC 시작)",
              ep, saved, toggle_desc)
+
+    # ---- 캡처 루프 stall 진단/완화 ----------------------------------------
+    # read_frame 의 모든 장치 읽기는 논블로킹(백그라운드 스레드+최신값 버퍼)이므로,
+    # 멀티초 gap 은 캡처 스레드가 '안 돌아간' 것 = (a) 대용량 객체 churn 의 GC 일시정지,
+    # (b) swap-in 페이지폴트 가 유력. 둘을 구분하기 위해 gap 시 read_frame 소요/직전 iter
+    # 소요/VmSwap 변화를 함께 로깅하고, 녹화 중에는 GC 를 끄고 IDLE 에서만 수거한다.
+    def _vmswap_kb():
+        try:
+            with open("/proc/self/status", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmSwap:"):
+                        return int(line.split()[1])
+        except OSError:
+            return -1
+        return 0
+
+    _gc_pause = {"t0": 0.0}
+
+    def _gc_cb(phase, info):
+        if phase == "start":
+            _gc_pause["t0"] = time.perf_counter()
+        elif phase == "stop":
+            dt = time.perf_counter() - _gc_pause["t0"]
+            if dt > 0.2:
+                log.warning("[gc] pause %.0fms gen=%s collected=%s",
+                            dt * 1e3, info.get("generation"), info.get("collected"))
+
+    gc.callbacks.append(_gc_cb)
+    gc.disable()  # 녹화 중 GC 일시정지 방지(수거는 IDLE 전환 시 명시적으로)
+    prev_read_ms = 0.0
+    prev_total_ms = 0.0
+    prev_swap = _vmswap_kb()
     try:
         while True:
             tick = time.perf_counter()
             fr = rec.read_frame()
+            read_ms = (time.perf_counter() - tick) * 1e3
             now = fr["ts"]
             started_this_tick = False
 
@@ -763,6 +814,9 @@ def main():
                         gap_events = []
                         last_hb = tick
                         a_min, a_max, nan_run, ang_last = reset_diag()
+                        # 녹화 중 비활성화한 GC 를 IDLE 진입 시 명시 수거(다음 녹화 전 청소).
+                        gc.collect()
+                        prev_swap = _vmswap_kb()
                         log.info("○ IDLE 대기   next=episode_%03d   saved=%d   (%s = REC 시작)",
                                  ep, saved, toggle_desc)
 
@@ -780,10 +834,17 @@ def main():
                                 "dt": dt,
                                 "elapsed": (now - rec_t0) if rec_t0 > 0.0 else 0.0,
                             })
+                            cur_swap = _vmswap_kb()
                             log.warning("[timing] frame gap   episode_%03d   dt=%.3fs   "
-                                        "frames=%d   target_dt=%.3fs",
-                                        ep, dt, len(frames), period)
-                    frames.append(fr)
+                                        "frames=%d   target_dt=%.3fs   "
+                                        "| 직전iter read=%.0fms total=%.0fms   swap=%dKB(Δ%+d)   "
+                                        "saveq=%s",
+                                        ep, dt, len(frames), period,
+                                        prev_read_ms, prev_total_ms,
+                                        cur_swap, cur_swap - prev_swap, saveq.status())
+                    # 캡처 즉시 이미지 PNG 인코딩(백그라운드 풀)하여 compact 프레임만 보관.
+                    # 원본 raw 이미지는 이 tick 의 fr 와 함께 다음 tick 에 해제됨.
+                    frames.append(rec.encode_frame(fr))
             else:
                 saveq.log_status()
 
@@ -817,6 +878,10 @@ def main():
             rem = period - (time.perf_counter() - tick)
             if rem > 0:
                 time.sleep(rem)
+            # gap 진단용: 직전 iteration 의 read_frame/전체 소요와 swap 점유 추적
+            prev_read_ms = read_ms
+            prev_total_ms = (time.perf_counter() - tick) * 1e3
+            prev_swap = _vmswap_kb()
     except KeyboardInterrupt:
         log.info("[shutdown] Ctrl-C 감지: 저장 큐 flush 후 종료합니다.")
         if recording and frames:
@@ -840,6 +905,11 @@ def main():
             log.info("[shutdown] 저장 큐 flush 완료")
         except Exception:
             log.exception("[saveq] 종료 전 flush 실패")
+        try:
+            writer.close()
+            log.info("[shutdown] writer 프로세스 종료")
+        except Exception:
+            log.exception("[writer] 종료 실패")
         log.info("[summary] saved=%d  next=episode_%03d  arms=%s", saved, ep, names)
         for ai in range(n):
             d = dets[ai]

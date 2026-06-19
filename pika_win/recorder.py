@@ -64,6 +64,9 @@ class _ArmIO:
 
 
 class EpisodeRecorder:
+    # 저장 대상 이미지 스트림(인코딩/기록 순서 고정)
+    IMAGE_KEYS = ("realsense_color", "realsense_depth", "fisheye_color")
+
     def __init__(self, out_dir, arms=None, record_hz=30, jpeg_quality=90,
                  use_pose=True, use_sense=True, use_realsense=True, use_fisheye=True,
                  settle=1.0, require_pose=False, require_all_trackers=False,
@@ -98,6 +101,10 @@ class EpisodeRecorder:
         self.pose_tip_frame = bool(pose_tip_frame)
         self.pose = None
         self.active = []   # list[_ArmIO] — 실제 활성 팔(1 또는 2)
+        # 캡처 중 이미지 PNG 인코딩을 담당하는 스레드풀(cv2.imencode 는 GIL 해제).
+        # 인코딩을 캡처 시간에 균등 분산 → 저장 시점 인코딩 버스트/원본 프레임 RAM 적재 제거.
+        self._encode_pool = ThreadPoolExecutor(
+            max_workers=self.encode_workers, thread_name_prefix="enc")
 
     @staticmethod
     def _clamp_png_compression(value):
@@ -336,6 +343,68 @@ class EpisodeRecorder:
         """활성 팔 전체의 현재 프레임을 반환. {"ts", "arms":[arm0, arm1?]}"""
         return {"ts": time.time(), "arms": [self._read_arm(io) for io in self.active]}
 
+    # ---------------- 점진 인코딩 / payload (async writer 경로) ----------------
+    def encode_frame(self, fr):
+        """raw 프레임 → 이미지를 PNG 인코딩 Future 로 치환한 compact 프레임.
+
+        캡처 루프가 매 녹화 프레임마다 호출한다. 인코딩은 백그라운드 풀에서 일어나므로
+        호출은 사실상 논블로킹이고, 반환된 compact 프레임만 보관하면 원본 이미지(raw)는
+        다음 tick 에 해제된다(에피소드 RAM = 인코딩 버퍼 합, 인코딩 버스트 없음).
+        """
+        arms_c = []
+        for arm in fr["arms"]:
+            enc = {}
+            for key in self.IMAGE_KEYS:
+                if key in arm:
+                    enc[key] = self._encode_pool.submit(self._encode_image, key, arm[key])
+            arms_c.append({
+                "pose": arm["pose"],
+                "gripper": arm["gripper"],
+                "command": arm["command"],
+                "enc": enc,
+            })
+        return {"ts": fr["ts"], "arms": arms_c}
+
+    def build_payload(self, frames_c):
+        """compact 프레임 리스트 → writer 프로세스로 보낼 picklable payload.
+
+        Future 들을 resolve(대개 이미 인코딩 완료) 하여 PNG bytes 로 고정한다. cv2/하드웨어
+        의존성이 없는 순수 데이터(dict/np.ndarray)만 담아 자식 프로세스로 넘긴다.
+        """
+        names = self.arm_names() or ["arm"]
+        n = len(names)
+        arms_meta = []
+        for ai in range(n):
+            io = self.active[ai] if ai < len(self.active) else None
+            s = io.spec if io is not None else self.arms_cfg[ai]
+            arms_meta.append({
+                "realsense_sn": str((s.realsense_sn if s else None) or ""),
+                "tracker_sn": str((getattr(io, "tracker_sn", None) if io else None) or ""),
+                "fisheye_dev": str((getattr(io, "fisheye_dev", None) if io else None) or ""),
+                "calib": (getattr(io.rs, "calib", None) if (io is not None and io.rs is not None) else None),
+            })
+        arms_data = []
+        for ai in range(n):
+            keys = list(frames_c[0]["arms"][ai]["enc"].keys()) if frames_c else []
+            images = {
+                key: [f["arms"][ai]["enc"][key].result() for f in frames_c]
+                for key in keys
+            }
+            arms_data.append({
+                "pose": [f["arms"][ai]["pose"] for f in frames_c],
+                "gripper": [f["arms"][ai]["gripper"] for f in frames_c],
+                "command": [f["arms"][ai]["command"] for f in frames_c],
+                "images": images,
+            })
+        return {
+            "record_hz": self.record_hz,
+            "pose_tip_frame": self.pose_tip_frame,
+            "names": names,
+            "ts": [f["ts"] for f in frames_c],
+            "arms_meta": arms_meta,
+            "arms_data": arms_data,
+        }
+
     # ---------------- HDF5 저장 ----------------
     def _write_obs(self, grp, frames, ai, vlen):
         """grp 아래 pose/gripper/command/images 작성, action 배열 반환."""
@@ -465,6 +534,12 @@ class EpisodeRecorder:
         return self.write_episode(os.path.join(self.out_dir, f"{name}.hdf5"), frames)
 
     def stop(self):
+        if self._encode_pool is not None:
+            try:
+                self._encode_pool.shutdown(wait=True)
+            except Exception:
+                pass
+            self._encode_pool = None
         for io in self.active:
             for c in (io.rs, io.sense, io.fisheye):
                 try:
