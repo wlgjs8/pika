@@ -555,8 +555,8 @@ def main():
     ap.add_argument("--min-record-sec", type=float, default=1.0,
                     help="REC 시작 직후 이 시간 안의 정지 토글은 무시")
     ap.add_argument("--start-index", type=int, default=0)
-    ap.add_argument("--no-realsense", default=False, action="store_true")
-    ap.add_argument("--no-fisheye", default=False, action="store_true",
+    ap.add_argument("--no-realsense", action="store_true")
+    ap.add_argument("--no-fisheye", action="store_true",
                     help="그리퍼 어안 카메라 수집 비활성화")
     ap.add_argument("--fisheye-devs", default="",
                     help="팔별 어안 디바이스(쉼표; /dev/videoN 또는 인덱스). "
@@ -582,8 +582,6 @@ def main():
                     help="그리퍼 캘리브레이션 통과에 필요한 최소 angle 변동폭")
     ap.add_argument("--calib-retries", type=int, default=3,
                     help="그리퍼 캘리브레이션 재시도 횟수")
-    ap.add_argument("--skip-gripper-calib", action="store_true",
-                    help="skip startup gripper open/close calibration (tracker-only captures; nominal open/closed)")
     ap.add_argument("--view", choices=["none", "web", "spawn"], default="none",
                     help="rerun 라이브 뷰어(뷰 전용): web=브라우저, spawn=네이티브 창, none=끔")
     ap.add_argument("--view-img-every", type=int, default=3, help="뷰어 카메라 로깅 간격(프레임)")
@@ -659,13 +657,7 @@ def main():
         n = rec.n_arms
         dets = []
         for ai, name in enumerate(names):
-            if a.skip_gripper_calib:
-                _rest = rec.read_gripper_angle(ai)
-                _rest = _rest if (_rest is not None and _rest == _rest) else 0.0
-                ov, cv = _rest + 30.0, _rest - 30.0
-                log.info("[calib][%s] SKIPPED (--skip-gripper-calib): open~%.1f closed~%.1f (nominal)", name, ov, cv)
-            else:
-                ov, cv = calibrate(rec, ai, name, min_span=a.calib_min_span, retries=a.calib_retries)
+            ov, cv = calibrate(rec, ai, name, min_span=a.calib_min_span, retries=a.calib_retries)
             det = GripperGestureDetector(ov, cv, double_window=a.window)
             dets.append(det)
             log.info("[gesture][%s] enter_closed=%.1f enter_open=%.1f dir=%+.0f window=%.1fs min_gap=%.0fms",

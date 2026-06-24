@@ -62,6 +62,9 @@ logs/
 wandb/
 outputs/
 
+*.json
+*.png
+
 # Agent tooling state (machine-local)
 .omc/
 .omx/
