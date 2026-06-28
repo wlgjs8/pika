@@ -72,6 +72,7 @@ class EpisodeRecorder:
                  settle=1.0, require_pose=False, require_all_trackers=False,
                  pose_valid_timeout=2.0, pose_tip_frame=False,
                  png_compression=1, png_depth_compression=None, encode_workers=None,
+                 arm_bolt_colors="right=black,left=gray",
                  # ---- 레거시 단일-팔 호환 kwargs (arms 미지정 시 사용) ----
                  com_port="COM3", realsense_sn=None):
         self.out_dir = out_dir
@@ -99,6 +100,10 @@ class EpisodeRecorder:
         # True 시 PIKA SDK 공식 트래커→그리퍼 팁 변환을 적용해 발행/기록
         # (pose_steamvr.apply_tip_transform 참조)
         self.pose_tip_frame = bool(pose_tip_frame)
+        # 세션 단위 볼트-색 배정: 각 팔이 이번 세션에서 집는 볼트 색 (예: "right=black,left=gray"=normal,
+        # "right=gray,left=black"=swap). 매 에피소드 HDF5 root attr `arm_bolt_colors`로 기록 →
+        # 변환기가 색-grounded 프롬프트를 배정. 미지정/레거시 데이터는 normal(right=black,left=gray)로 간주.
+        self.arm_bolt_colors = str(arm_bolt_colors)
         self.pose = None
         self.active = []   # list[_ArmIO] — 실제 활성 팔(1 또는 2)
         # 캡처 중 이미지 PNG 인코딩을 담당하는 스레드풀(cv2.imencode 는 GIL 해제).
@@ -399,6 +404,7 @@ class EpisodeRecorder:
         return {
             "record_hz": self.record_hz,
             "pose_tip_frame": self.pose_tip_frame,
+            "arm_bolt_colors": self.arm_bolt_colors,
             "names": names,
             "ts": [f["ts"] for f in frames_c],
             "arms_meta": arms_meta,
@@ -486,6 +492,7 @@ class EpisodeRecorder:
                 h.attrs["pose_format"] = "x,y,z,qx,qy,qz,qw"
                 h.attrs["n_arms"] = n
                 h.attrs["arm_names"] = ",".join(names)
+                h.attrs["arm_bolt_colors"] = self.arm_bolt_colors
                 h.create_dataset("timestamp", data=ts)
 
                 if n == 1:
