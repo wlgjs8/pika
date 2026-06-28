@@ -555,6 +555,11 @@ def main():
     ap.add_argument("--min-record-sec", type=float, default=1.0,
                     help="REC 시작 직후 이 시간 안의 정지 토글은 무시")
     ap.add_argument("--start-index", type=int, default=0)
+    ap.add_argument("--arm-bolt-colors", default="right=black,left=gray",
+                    help="이번 세션에서 각 팔이 집는 볼트 색 (예: 'right=black,left=gray'=normal, "
+                         "'right=gray,left=black'=swap). 매 에피소드 HDF5 attr `arm_bolt_colors`로 기록 → "
+                         "변환기가 색-grounded 프롬프트 배정. 박스는 색-매칭(coordinated)이라 별도 표기 불필요. "
+                         "미지정/레거시 데이터는 normal로 간주.")
     ap.add_argument("--no-realsense", default=False, action="store_true")
     ap.add_argument("--no-fisheye", default=False, action="store_true",
                     help="그리퍼 어안 카메라 수집 비활성화")
@@ -645,7 +650,9 @@ def main():
                           png_compression=a.png_compression,
                           png_depth_compression=(
                               None if a.png_depth_compression < 0 else a.png_depth_compression),
-                          encode_workers=(None if a.encode_workers <= 0 else a.encode_workers))
+                          encode_workers=(None if a.encode_workers <= 0 else a.encode_workers),
+                          arm_bolt_colors=a.arm_bolt_colors)
+    log.info("[collect] arm_bolt_colors=%s (per-session bolt assignment -> HDF5 attr)", a.arm_bolt_colors)
     log.info("[save] max_pending=%d encode_workers=%d png_compression=%d depth_png=%s",
              max(1, a.save_max_pending), rec.encode_workers, rec.png_compression,
              "opencv-default" if rec.png_depth_compression is None else rec.png_depth_compression)

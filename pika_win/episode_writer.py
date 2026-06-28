@@ -109,6 +109,8 @@ def write_episode_payload(path, payload):
             h.attrs["pose_format"] = "x,y,z,qx,qy,qz,qw"
             h.attrs["n_arms"] = n
             h.attrs["arm_names"] = ",".join(names)
+            # per-session bolt-color assignment (default normal if a legacy payload omits it)
+            h.attrs["arm_bolt_colors"] = payload.get("arm_bolt_colors", "right=black,left=gray")
             h.create_dataset("timestamp", data=ts)
             if n == 1:
                 meta = payload["arms_meta"][0]
