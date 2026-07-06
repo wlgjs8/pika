@@ -13,6 +13,6 @@ fi
 exec python3 scripts/umi_teleop_publish.py \
   --pedal \
   --swap-lr \
-  --target-host 172.28.60.12 \
-  --gripper-port 0 \
+  --target-host 172.28.61.3 \
+  --gripper-port 50382 \
   "$@"
