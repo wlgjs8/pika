@@ -33,7 +33,7 @@ deadman(클러치)은 PikaAnyArm 트리거와 동일한 토글 의미:
   키보드 키로 토글 (Windows msvcrt / Linux cbreak). 좌/우 개별 또는 공유.
 
 실행(Windows, SteamVR 실행 + 트래커 + Sense 연결):
-  conda run -n pika python scripts\\umi_teleop_publish.py \
+  .venv/bin/python scripts/umi_teleop_publish.py \
     --target-host 192.168.8.x --left-port 50380 --right-port 50381
 
 키: [space]=양팔 클러치 토글, [a]=좌팔, [l]=우팔, [q]=종료.

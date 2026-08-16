@@ -3,9 +3,9 @@
 
 네이티브 창이 안 뜨는 환경(GPU/wgpu/원격 등)에서는 --mode web (브라우저 뷰어)를 쓰세요.
 실행:
-  conda run -n pika python scripts\\visualize_pose_rerun.py               # 기본: web(브라우저)
-  conda run -n pika python scripts\\visualize_pose_rerun.py --mode spawn  # 네이티브 창
-  conda run -n pika python scripts\\visualize_pose_rerun.py --mode save   # .rrd 파일로 저장 후 'rerun file.rrd'
+  .venv/bin/python scripts/visualize_pose_rerun.py               # 기본: web(브라우저)
+  .venv/bin/python scripts/visualize_pose_rerun.py --mode spawn  # 네이티브 창
+  .venv/bin/python scripts/visualize_pose_rerun.py --mode save   # .rrd 파일로 저장 후 'rerun file.rrd'
 종료: Ctrl-C
 """
 import argparse

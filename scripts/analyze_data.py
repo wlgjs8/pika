@@ -26,8 +26,8 @@ try:
 except ImportError as e:
     missing = getattr(e, "name", "h5py/numpy")
     sys.exit(
-        f"Missing dependency: {missing}. Run with the pika conda env, e.g.\n"
-        "  conda run -n pika python scripts/analyze_data.py data\n"
+        f"Missing dependency: {missing}. Run with the repo venv, e.g.\n"
+        "  .venv/bin/python scripts/analyze_data.py data\n"
     )
 
 

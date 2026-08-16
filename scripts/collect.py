@@ -7,8 +7,8 @@
 - rerun 라이브 뷰어(--view)는 팔별로 카메라/포즈/그리퍼를 모두 표시.
 - 모든 상태/그리퍼/시리얼 진단은 stdout 로깅.
 
-실행: conda run -n pika python scripts\\collect.py                 (헤드리스 + 진단)
-      conda run -n pika python scripts\\collect.py --view web      (브라우저 뷰어)
+실행: .venv/bin/python scripts/collect.py                 (헤드리스 + 진단)
+      .venv/bin/python scripts/collect.py --view web      (브라우저 뷰어)
 양팔 매핑은 보통 config/arms.json(make identify 로 생성)으로 고정. CLI 예: --coms COM3,COM4 또는 /dev/serial/by-id/...
 전제: SteamVR/OpenVR 또는 호환 포즈 백엔드 실행, PIKA Sense USB 시리얼 연결, RealSense 연결.
 종료: Ctrl-C (녹화 중이면 마지막 에피소드 저장)

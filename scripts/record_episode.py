@@ -2,8 +2,8 @@
 """에피소드 1개 기록 — 포즈/그리퍼/RealSense를 동기화해 HDF5로 저장.
 
 실행 예:
-  conda run -n pika python scripts\\record_episode.py --duration 5 --name ep001
-  conda run -n pika python scripts\\record_episode.py --duration 5 --no-realsense   # 디버그
+  .venv/bin/python scripts/record_episode.py --duration 5 --name ep001
+  .venv/bin/python scripts/record_episode.py --duration 5 --no-realsense   # 디버그
 전제: SteamVR 실행(포즈), PIKA Sense USB 시리얼 연결, RealSense 연결.
 """
 import argparse

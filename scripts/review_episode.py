@@ -2,7 +2,7 @@
 """Generate a frame-by-frame HTML review page for collected episodes.
 
 Default usage:
-  conda run --no-capture-output -n pika python scripts/review_episode.py
+  .venv/bin/python scripts/review_episode.py
 
 The script picks the newest data/data_* session folder, extracts color frames
 for every episode in that folder, and serves an HTML viewer for checking image,

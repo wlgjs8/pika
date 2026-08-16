@@ -2,7 +2,7 @@
 """PIKA Sense 시리얼(COM 포트) Windows 동작 검증 — 공식 pika.Sense 사용.
 
 읽기 전용: 버전/엔코더(그리퍼 각도)/command + 원시 JSON(IMU 포함 스키마) 덤프.
-실행: conda run -n pika python scripts\\test_sense_serial.py [COM3]
+실행: .venv/bin/python scripts/test_sense_serial.py [COM3]
 """
 import os
 import sys

@@ -7,7 +7,7 @@
 
 ⚠️ 실행 전 collect.py(make run/make view)를 반드시 종료하세요(장치 점유 충돌).
 Linux에서는 가능한 경우 /dev/serial/by-id/... 경로를 com_port에 저장한다.
-실행: conda run -n pika python scripts\\identify_arms.py
+실행: .venv/bin/python scripts/identify_arms.py
 """
 import glob
 import json

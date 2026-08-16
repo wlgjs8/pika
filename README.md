@@ -306,6 +306,25 @@ make view VIEW=web ARGS="--hz 30"
 make run PY="conda run --no-capture-output -n pika python"   # conda 환경을 쓸 때
 ```
 
+## 래퍼 스크립트
+
+`scripts/*.sh` 는 모두 `scripts/_venv.sh` 를 source 해서 `.venv/bin/python` 을 씁니다
+(conda 불필요). 다른 인터프리터는 `PY` 로 덮어씁니다.
+
+```bash
+./scripts/run_collect_fast.sh     # 헤드리스 수집 (뷰어 없음, 최대 처리량)
+./scripts/run_collect_web.sh      # 브라우저 뷰어와 함께 수집
+./scripts/run_review_episode.sh   # 에피소드 리뷰 서버 (기본 8088)
+./scripts/analyze_data.sh data --latest
+PY="conda run --no-capture-output -n pika python" ./scripts/run_collect_web.sh
+```
+
+수집 래퍼는 하드웨어를 **`config/arms.json` 에서만** 읽습니다. 예전에는 `--config ''` 로
+arms.json 을 무시하고 `--coms /dev/ttyUSB0,/dev/ttyUSB1` 을 강제했는데, 그 두 포트는
+지금 **로봇팔 그리퍼**라 엉뚱한 장치를 열거나 robotics_lab 과 충돌합니다. 임시로 다른
+하드웨어를 쓰려면 `PIKA_CONFIG` / `PIKA_COMS` / `PIKA_RS_SNS` / `PIKA_TRACKER_SNS` 를
+명시할 때만 CLI 인자가 붙습니다.
+
 ## teleop 발행 (robotics_lab 연동)
 
 ```bash
