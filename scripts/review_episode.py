@@ -14,7 +14,7 @@ HTTP 서버를 띄우지 않는다(13 에피소드 빌드에 2분 이상 걸리�
 
 조작키
   space      재생/일시정지          .  ,     다음/이전 프레임
-  ] [        다음/이전 에피소드      + -     재생 속도
+  d  a       다음/이전 에피소드      + -     재생 속도
   g          첫 프레임으로           e       마지막 프레임으로
   s          현재 화면 PNG 저장      h       도움말 토글
   q / ESC    종료
@@ -249,7 +249,7 @@ def _compose(ep, idx, cell_w, cell_h, show_help):
             parts.append("grip=" + ",".join(f"{v:.3f}" for v in g))
         lines.append("   ".join(parts))
     if show_help:
-        lines.append("space 재생/정지  . , 프레임  ] [ 에피소드  + - 속도  g e 처음/끝  s 저장  h 도움말  q 종료")
+        lines.append("space 재생/정지  . , 프레임  d a 에피소드  + - 속도  g e 처음/끝  s 저장  h 도움말  q 종료")
 
     bar = np.zeros((18 * len(lines) + 8, grid.shape[1], 3), np.uint8)
     for i, text in enumerate(lines):
@@ -329,9 +329,9 @@ def main():
                 playing, idx = False, min(idx + 1, ep.n - 1)
             elif key in (ord(","), 81):        # , 또는 ←
                 playing, idx = False, max(idx - 1, 0)
-            elif key == ord("]"):
+            elif key == ord("d"):
                 open_episode(ep_idx + 1)
-            elif key == ord("["):
+            elif key == ord("a"):
                 open_episode(ep_idx - 1)
             elif key == ord("g"):
                 idx = 0
