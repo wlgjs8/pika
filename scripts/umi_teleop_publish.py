@@ -53,6 +53,7 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
+from pika_win.pedal import find_pedal_devices, open_pedal  # noqa: E402
 from pika_win.sdk_logging import quiet_pika_sdk_info  # noqa: E402
 
 log = logging.getLogger("pika.umi_teleop")
@@ -293,10 +294,13 @@ class PedalClutch:
     EV_KEY = 0x01
     EVENT = struct.Struct("llHHi")  # input_event: timeval(2 long) + type + code + value
 
-    def __init__(self, device="auto", toggle=False, debounce_sec=0.05):
+    def __init__(self, device="auto", toggle=False, debounce_sec=0.05, grab=True):
         self.device_arg = device
         self.toggle = bool(toggle)
         self.debounce_sec = max(0.0, float(debounce_sec))
+        # 기본 배타 점유: 안 하면 발판이 키보드로도 동작해 포커스된 창/터미널에
+        # 'b' 를 계속 입력한다(PCsensor 기본 키맵).
+        self.grab = bool(grab)
         self.fds = {}            # path -> fd (발판이 여러 개면 전부 수신)
         self.path = None         # 표시용(여러 개면 쉼표 결합)
         self._raw_by_fd = {}     # fd -> 그 장치의 raw 눌림 상태
@@ -309,40 +313,7 @@ class PedalClutch:
         self._raw_held = False
         self._last_edge_mono = 0.0
 
-    @staticmethod
-    def find_devices():
-        """연결된 FootSwitch 키보드 evdev 경로 전부(sysfs 이름 기준, 정렬).
-
-        **by-id 를 쓰면 안 된다.** 발판 2개는 VID:PID 가 같고 시리얼이 없어서 udev 가
-        이름 충돌을 피하려고 `/dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd` 를
-        먼저 잡힌 하나에만 만든다. 나머지 발판은 by-id 에 아예 나타나지 않아
-        구조적으로 인식이 불가능하다. sysfs 의 device/name 으로 직접 찾는다.
-        """
-        # eventN -> by-path 역인덱스. by-path 는 물리 USB 포트 기반이라 발판이 여러 개여도
-        # 충돌하지 않고 재부팅/재연결에도 안정적이다(eventN 번호는 바뀐다).
-        by_path = {}
-        for link in glob.glob("/dev/input/by-path/*-event-kbd"):
-            try:
-                by_path[os.path.realpath(link)] = link
-            except OSError:
-                continue
-        kbd, other = [], []
-        for d in sorted(glob.glob("/sys/class/input/event*")):
-            try:
-                with open(os.path.join(d, "device", "name"), encoding="utf-8") as f:
-                    name = f.read().strip()
-            except OSError:
-                continue
-            low = name.lower()
-            if "footswitch" not in low or "mouse" in low:
-                continue
-            node = "/dev/input/" + os.path.basename(d)
-            (kbd if "keyboard" in low else other).append(by_path.get(node, node))
-        # 발판 하나가 Keyboard/Mouse/보조 HID 3개 노드를 만든다. **Keyboard 노드만** 쓴다.
-        # 보조 노드는 press 만 보내고 release 를 안 보낼 수 있는데, deadman 클러치에서
-        # 그러면 눌림 상태가 True 로 고착돼 클러치가 영구 engage 된다(안전 문제).
-        # Keyboard 노드가 하나도 없는 모델을 대비해서만 보조 노드로 폴백한다.
-        return sorted(kbd or other)
+    find_devices = staticmethod(find_pedal_devices)
 
     def _resolve_devices(self):
         if self.device_arg not in ("auto", ""):
@@ -370,7 +341,7 @@ class PedalClutch:
         errors = []
         for path in paths:
             try:
-                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                fd = open_pedal(path, grab=self.grab)
             except OSError as e:
                 errors.append(f"{path}: {e}")
                 continue
@@ -552,6 +523,9 @@ def get_arguments():
                     help="USB 발판(FootSwitch)을 클러치로 사용(키보드 대신, stdin 무의존)")
     ap.add_argument("--pedal-device", default="auto",
                     help="발판 evdev 경로(기본 auto=/dev/input/by-id/*FootSwitch*event-kbd)")
+    ap.add_argument("--no-pedal-grab", dest="pedal_grab", action="store_false",
+                    help="발판 배타 점유(EVIOCGRAB) 비활성. 기본은 점유해서 발판 키가 "
+                         "터미널/창으로 새는 것을 막는다. 진단용으로만 끌 것")
     ap.add_argument("--pedal-toggle", action="store_true",
                     help="발판을 밟을 때마다 토글(기본은 밟는 동안만 engage하는 momentary)")
     ap.add_argument("--pedal-debounce-sec", type=float, default=0.05,
@@ -608,9 +582,11 @@ def main():
 
     if a.pedal:
         clutch = PedalClutch(a.pedal_device, toggle=a.pedal_toggle,
-                             debounce_sec=a.pedal_debounce_sec).start()
+                             debounce_sec=a.pedal_debounce_sec,
+                             grab=a.pedal_grab).start()
         mode = "토글(밟을 때마다)" if a.pedal_toggle else "momentary(밟는 동안)"
-        log.info("[umi] 발판 클러치: %s  device=%s  (%s)", "ON", clutch.path, mode)
+        log.info("[umi] 발판 클러치: %s  device=%s  (%s, %s)", "ON", clutch.path, mode,
+                 "배타 점유" if a.pedal_grab else "점유 안 함(키가 터미널로 샘)")
     else:
         clutch = KeyboardClutch(a.left_key, a.right_key, a.both_key).start()
         if a.start_engaged:

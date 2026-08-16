@@ -32,6 +32,7 @@ sys.path.insert(0, REPO_ROOT)
 from pika_win.recorder import EpisodeRecorder, ArmSpec  # noqa: E402
 from pika_win.episode_writer import EpisodeWriterProcess  # noqa: E402
 from pika_win.gesture import GripperGestureDetector, calibrate_open_closed  # noqa: E402
+from pika_win.pedal import find_pedal_devices, open_pedal  # noqa: E402
 from pika_win.sdk_logging import quiet_pika_sdk_info  # noqa: E402
 from pika_win.viewer import make_viewer  # noqa: E402
 
@@ -485,7 +486,15 @@ class PedalToggle:
             return None
         if self.device_arg != "auto":
             return self.device_arg
-        candidates = sorted(glob.glob("/dev/input/by-id/*FootSwitch*event-kbd"))
+        # by-id 가 아니라 by-path 로 찾는다(pika_win.pedal.find_pedal_devices 주석 참조).
+        candidates = find_pedal_devices()
+        if len(candidates) > 1:
+            # 발판이 여러 개면 자동 선택하지 않는다 — 전부 VID:PID·evdev capability 가
+            # 동일해 소프트웨어로 구별할 수 없고, 이 리그의 다른 발판은 robotics_lab
+            # rb_gui(InitMotion) 전용이다. --pedal-device 로 지정할 것.
+            self.reason = ("여러 발판이 감지됨(구별 불가) — --pedal-device 로 지정하세요: "
+                           + ", ".join(candidates))
+            return None
         if candidates:
             return candidates[0]
         self.reason = "FootSwitch event-kbd device not found"
@@ -499,7 +508,10 @@ class PedalToggle:
         if not path:
             return False
         try:
-            self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            # 배타 점유 필수: grab 하지 않으면 발판이 키보드로도 동작해 stdin 에 'b' 를
+            # 넣는데, 이 스크립트는 'b' 를 녹화 토글로 쓴다 → evdev 한 번 + stdin 한 번
+            # = 즉시 시작·정지로 상쇄되어 녹화가 걸리지 않는다.
+            self.fd = open_pedal(path, grab=True)
         except PermissionError as e:
             self.reason = f"{path}: permission denied ({e})"
             return False
