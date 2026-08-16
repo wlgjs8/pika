@@ -23,10 +23,8 @@ HTTP 서버를 띄우지 않는다(13 에피소드 빌드에 2분 이상 걸리�
 """
 import argparse
 import glob
-import math
 import os
-import re
-import sys
+import threading
 import time
 
 import cv2
@@ -196,6 +194,7 @@ class Episode:
                     if images is not None and k in images
                     and (not want_streams or alias in want_streams)]
             self.arms.append({
+                "ai": len(self.arms),
                 "name": arm,
                 "base": base,
                 "keys": keys,
@@ -205,20 +204,70 @@ class Episode:
             })
         self.n = int(len(self.ts))
 
+        # 프레임 하나를 그리려면 스트림 수만큼 PNG 를 디코드해야 한다(양팔 3스트림 = 6장,
+        # 실측 ~34ms). 그냥 두면 재생 fps 가 디코드 시간에 묶여 30Hz 수집분이 절반 속도로
+        # 재생된다 → 표시 중에 다음 프레임을 미리 디코드해 두는 워커를 둔다.
+        self._cache = {}                     # (ai, key, idx) -> img
+        self._lock = threading.Lock()
+        self._want = None                    # 프리페치 목표 프레임
+        self._stop = threading.Event()
+        self._worker = threading.Thread(target=self._prefetch_loop, daemon=True)
+        self._worker.start()
+
     @property
     def duration(self):
         return float(self.ts[-1] - self.ts[0]) if self.n > 1 else 0.0
 
-    def frame_image(self, arm, key, idx):
+    def _decode(self, arm, key, idx):
         ds = self.h5.get(f"{arm['base']}/images/{key}")
-        if ds is None or idx >= len(ds):
+        if ds is None or idx < 0 or idx >= len(ds):
             return None
         img = _decode_image(ds[idx], key)
         if key.endswith("depth"):
             img = _depth_visualization(img, arm["lut"])
         return img
 
+    def frame_image(self, arm, key, idx):
+        ckey = (arm["ai"], key, idx)
+        with self._lock:
+            if ckey in self._cache:
+                return self._cache[ckey]
+        img = self._decode(arm, key, idx)      # h5py 읽기는 락 밖에서(워커와 겹쳐도 GIL 하에 안전)
+        with self._lock:
+            self._cache[ckey] = img
+        return img
+
+    def prefetch(self, idx):
+        """idx 프레임을 미리 디코드해 두라고 워커에 알린다."""
+        with self._lock:
+            self._want = idx
+            # 현재 위치에서 멀어진 항목은 버려 메모리를 묶어 둔다(프레임 3개분).
+            for k in [k for k in self._cache if abs(k[2] - idx) > 2]:
+                del self._cache[k]
+
+    def _prefetch_loop(self):
+        while not self._stop.wait(0.002):
+            with self._lock:
+                idx, want = self._want, self._want
+            if want is None:
+                continue
+            for arm in self.arms:
+                for key in arm["keys"]:
+                    if self._stop.is_set():
+                        return
+                    with self._lock:
+                        if self._want != idx:      # 목표가 바뀌면 즉시 포기
+                            break
+                        done = (arm["ai"], key, idx) in self._cache
+                    if not done:
+                        self.frame_image(arm, key, idx)
+            with self._lock:
+                if self._want == idx:
+                    self._want = None              # 이 프레임은 완료
+
     def close(self):
+        self._stop.set()
+        self._worker.join(timeout=1.0)
         try:
             self.h5.close()
         except Exception:
@@ -232,7 +281,7 @@ def _stream_title(key):
     return key
 
 
-def _compose(ep, idx, cell_w, cell_h, show_help):
+def _compose(ep, idx, cell_w, cell_h, show_help, achieved_fps=0.0):
     """팔=행, 스트림=열 격자 + 하단 상태줄."""
     rows = []
     for arm in ep.arms:
@@ -248,10 +297,13 @@ def _compose(ep, idx, cell_w, cell_h, show_help):
     grid = np.vstack(rows)
 
     # ---- 상태줄: 팔별 pose/gripper ----
+    rec_hz = ep.attrs.get("effective_hz")
+    rec_txt = f"rec {float(rec_hz):.1f}Hz" if rec_hz else ""
     lines = [
         f"{ep.session}/{ep.name}   frame {idx + 1}/{ep.n}   "
         f"t={ep.ts[idx] - ep.ts[0]:6.2f}s / {ep.duration:.2f}s   "
-        f"{ep.attrs.get('pose_frame', '?')} ({ep.attrs.get('pose_backend', 'backend?')})"
+        f"{ep.attrs.get('pose_frame', '?')} ({ep.attrs.get('pose_backend', 'backend?')})   "
+        f"{rec_txt}  play {achieved_fps:4.1f}fps"
     ]
     for arm in ep.arms:
         pose, grip = arm["pose"], arm["gripper"]
@@ -340,13 +392,22 @@ def main():
     open_episode(start)
 
     last = time.perf_counter()
+    shown = last
+    achieved = 0.0
     try:
         while True:
-            canvas = _compose(ep, idx, a.cell_width, a.cell_height, show_help)
+            period = 1.0 / max(1e-3, a.fps * speed)
+            ep.prefetch(idx + 1 if playing else idx)   # 표시 중에 다음 프레임 디코드
+            canvas = _compose(ep, idx, a.cell_width, a.cell_height, show_help, achieved)
             cv2.imshow(WINDOW, canvas)
 
-            period = 1.0 / max(1e-3, a.fps * speed)
-            key = cv2.waitKey(max(1, int(period * 1000)) if playing else 20) & 0xFF
+            now = time.perf_counter()
+            achieved = 0.8 * achieved + 0.2 / max(1e-6, now - shown) if achieved else 1.0 / max(1e-6, now - shown)
+            shown = now
+            # **렌더에 쓴 시간을 대기에서 뺀다.** 빼지 않으면 waitKey(period) 가 렌더 시간
+            # 위에 그대로 더해져 30Hz 수집분이 절반 속도로 재생된다(실측 15fps).
+            wait_ms = int((last + period - now) * 1000) if playing else 20
+            key = cv2.waitKey(max(1, wait_ms)) & 0xFF
 
             if key in (ord("q"), 27):
                 break
@@ -381,13 +442,17 @@ def main():
             if playing:
                 now = time.perf_counter()
                 if now - last >= period:
-                    last = now
-                    if idx + 1 < ep.n:
-                        idx += 1
+                    # 렌더가 period 보다 오래 걸리면 뒤처진 만큼 배수로 진행하되(드리프트
+                    # 방지), 한 번에 몰아서 튀지 않게 상한을 둔다.
+                    steps = min(int((now - last) / period), 4)
+                    last += steps * period
+                    if idx + steps < ep.n:
+                        idx += steps
                     elif ep_idx + 1 < len(paths):
                         open_episode(ep_idx + 1)   # 다음 에피소드로 이어서
+                        last = time.perf_counter()
                     else:
-                        playing = False            # 마지막에서 정지
+                        idx, playing = ep.n - 1, False   # 마지막에서 정지
 
             seeking["user"] = True
             cv2.setTrackbarPos("frame", WINDOW, idx)
