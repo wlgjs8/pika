@@ -14,9 +14,9 @@ import sys
 import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+sys.path.insert(0, REPO_ROOT)
 
-from umi_teleop_publish import PedalClutch  # noqa: E402
+from pika_win.pedal import find_pedal_devices, open_pedal  # noqa: E402
 
 EVENT = struct.Struct("llHHi")
 EV_KEY = 0x01
@@ -35,22 +35,32 @@ def _sysfs(path, field):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=30.0)
+    ap.add_argument("--grab", default=None,
+                    help="이 경로를 배타 점유한 채로 진단(teleop 발행자와 같은 상태 재현). "
+                         "'teleop' 이라고 쓰면 run_umi_teleop_publish.sh 가 고정한 발판을 사용. "
+                         "점유된 발판은 키가 터미널로 새지 않아야 하고, 그래도 글자가 찍히면 "
+                         "그 글자는 여기 표시되는 다른 노드에서 나온 것이다")
     a = ap.parse_args()
 
-    paths = PedalClutch.find_devices()
+    paths = find_pedal_devices()
     if not paths:
         print("발판을 찾지 못했습니다. lsusb 로 3553:b001 이 보이는지, "
               "/dev/input/event* 권한(plugdev)이 있는지 확인하세요.")
         return 1
+
+    grab_path = a.grab
+    if grab_path == "teleop":
+        grab_path = "/dev/input/by-path/pci-0000:11:00.0-usb-0:4:1.0-event-kbd"
 
     print(f"발판 키보드 노드 {len(paths)}개:")
     fds = {}
     for p in paths:
         phys = _sysfs(p, "phys")
         name = _sysfs(p, "name")
+        want_grab = (grab_path is not None and os.path.realpath(p) == os.path.realpath(grab_path))
         try:
-            fds[os.open(p, os.O_RDONLY | os.O_NONBLOCK)] = (p, phys)
-            state = "열림"
+            fds[open_pedal(p, grab=want_grab)] = (p, phys)
+            state = "열림 + 배타점유" if want_grab else "열림"
         except OSError as e:
             state = f"열기 실패({e})"
         print(f"  {p:20s} phys={phys:28s} name='{name}'  {state}")
