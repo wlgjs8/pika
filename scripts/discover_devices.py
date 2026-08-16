@@ -2,7 +2,7 @@
 """연결된 장치 열거 — COM 포트(시리얼), 카메라 인덱스(DSHOW), RealSense.
 
 PIKA Sense를 Windows USB에 연결한 뒤 실행해 포트/인덱스를 확인한다.
-실행: conda run -n pika python scripts\\discover_devices.py
+실행: .venv/bin/python scripts/discover_devices.py
 """
 print("=== COM ports (시리얼: PIKA Sense/Gripper 후보) ===")
 try:

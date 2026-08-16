@@ -2,6 +2,10 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/_venv.sh
+source scripts/_venv.sh
+# shellcheck source=scripts/_pedal.sh  (1구 발판 고정 — 수집과 공유)
+source scripts/_pedal.sh
 
 if [[ -z "${DISPLAY:-}" && -S /tmp/.X11-unix/X0 ]]; then
   export DISPLAY=:0
@@ -10,9 +14,31 @@ if [[ -z "${XAUTHORITY:-}" && -r "$HOME/.Xauthority" ]]; then
   export XAUTHORITY="$HOME/.Xauthority"
 fi
 
-exec python3 scripts/umi_teleop_publish.py \
+# 수신자(robotics_lab policy_runner)가 같은 PC 에서 도는 것이 기본.
+# 별도 로봇 PC 로 쏘려면: TARGET_HOST=172.28.61.3 scripts/run_umi_teleop_publish.sh
+TARGET_HOST="${TARGET_HOST:-127.0.0.1}"
+
+# 클러치로 안 쓰는 나머지 발판까지 점유해 키 누수를 막는다(이벤트는 안 읽음).
+# 안 막으면 3구 발판을 밟는 동안 X11 오토리피트로 터미널이 'bbbb...' 로 도배된다.
+#
+# 평소 순서(robotics_lab `make run` 먼저 → 발행자)에서는 rb_gui 가 이미 3구를 점유하고
+# 있어 여기 grab 이 실패하는데, 그건 이미 막혀 있다는 뜻이라 무해하다(경고만 남는다).
+# 반대로 **발행자를 먼저 띄우면 rb_gui 가 자기 발판을 못 잡아 InitMotion 발판이 죽는다.**
+# 그 순서로 쓸 일이 있으면 MUTE_OTHER_PEDALS=0 으로 끌 것.
+MUTE_OTHER_PEDALS="${MUTE_OTHER_PEDALS:-1}"
+MUTE_FLAG=()
+if [[ "$MUTE_OTHER_PEDALS" != "0" ]]; then
+  MUTE_FLAG=(--mute-other-pedals)
+fi
+
+# --pose-frame 은 기본 tip. robotics_lab stack_real.yaml 의 umi_dual_cartesian 이
+# gripper_offset: [0,0,0] + tip→TCP r_align 로 짝지어져 있으므로 tip 을 유지해야 한다
+# (raw 로 보내려면 수신측 legacy fallback 값으로 함께 되돌려야 함).
+exec "${PY_CMD[@]}" scripts/umi_teleop_publish.py \
   --pedal \
+  --pedal-device "$PEDAL_DEVICE" \
+  "${MUTE_FLAG[@]}" \
   --swap-lr \
-  --target-host 172.28.61.3 \
+  --target-host "$TARGET_HOST" \
   --gripper-port 50382 \
   "$@"

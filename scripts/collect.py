@@ -4,11 +4,9 @@
 - 인식된 Vive 트래커 개수로 모드 자동: 1개=한팔, 2개=양팔(BIMANUAL).
 - 키보드 b 키로 녹화 시작/정지 토글. 그리퍼 움직임은 녹화 제어에 사용하지 않음.
 - 시작~정지 구간 = 에피소드 1개 → data/data_<시각>/episode_NNN.hdf5 자동 저장.
-- rerun 라이브 뷰어(--view)는 팔별로 카메라/포즈/그리퍼를 모두 표시.
 - 모든 상태/그리퍼/시리얼 진단은 stdout 로깅.
 
-실행: conda run -n pika python scripts\\collect.py                 (헤드리스 + 진단)
-      conda run -n pika python scripts\\collect.py --view web      (브라우저 뷰어)
+실행: .venv/bin/python scripts/collect.py                 (헤드리스 + 진단)
 양팔 매핑은 보통 config/arms.json(make identify 로 생성)으로 고정. CLI 예: --coms COM3,COM4 또는 /dev/serial/by-id/...
 전제: SteamVR/OpenVR 또는 호환 포즈 백엔드 실행, PIKA Sense USB 시리얼 연결, RealSense 연결.
 종료: Ctrl-C (녹화 중이면 마지막 에피소드 저장)
@@ -32,8 +30,8 @@ sys.path.insert(0, REPO_ROOT)
 from pika_win.recorder import EpisodeRecorder, ArmSpec  # noqa: E402
 from pika_win.episode_writer import EpisodeWriterProcess  # noqa: E402
 from pika_win.gesture import GripperGestureDetector, calibrate_open_closed  # noqa: E402
+from pika_win.pedal import find_pedal_devices, open_pedal  # noqa: E402
 from pika_win.sdk_logging import quiet_pika_sdk_info  # noqa: E402
-from pika_win.viewer import make_viewer  # noqa: E402
 
 log = logging.getLogger("collect")
 
@@ -485,7 +483,15 @@ class PedalToggle:
             return None
         if self.device_arg != "auto":
             return self.device_arg
-        candidates = sorted(glob.glob("/dev/input/by-id/*FootSwitch*event-kbd"))
+        # by-id 가 아니라 by-path 로 찾는다(pika_win.pedal.find_pedal_devices 주석 참조).
+        candidates = find_pedal_devices()
+        if len(candidates) > 1:
+            # 발판이 여러 개면 자동 선택하지 않는다 — 전부 VID:PID·evdev capability 가
+            # 동일해 소프트웨어로 구별할 수 없고, 이 리그의 다른 발판은 robotics_lab
+            # rb_gui(InitMotion) 전용이다. --pedal-device 로 지정할 것.
+            self.reason = ("여러 발판이 감지됨(구별 불가) — --pedal-device 로 지정하세요: "
+                           + ", ".join(candidates))
+            return None
         if candidates:
             return candidates[0]
         self.reason = "FootSwitch event-kbd device not found"
@@ -499,7 +505,10 @@ class PedalToggle:
         if not path:
             return False
         try:
-            self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            # 배타 점유 필수: grab 하지 않으면 발판이 키보드로도 동작해 stdin 에 'b' 를
+            # 넣는데, 이 스크립트는 'b' 를 녹화 토글로 쓴다 → evdev 한 번 + stdin 한 번
+            # = 즉시 시작·정지로 상쇄되어 녹화가 걸리지 않는다.
+            self.fd = open_pedal(path, grab=True)
         except PermissionError as e:
             self.reason = f"{path}: permission denied ({e})"
             return False
@@ -564,11 +573,23 @@ def main():
     ap.add_argument("--no-realsense", default=False, action="store_true")
     ap.add_argument("--no-fisheye", default=False, action="store_true",
                     help="그리퍼 어안 카메라 수집 비활성화")
+    ap.add_argument("--no-depth", default=False, action="store_true",
+                    help="RealSense depth 스트림 비활성화(color 만 수집). 스트림과 함께 "
+                         "rs.align(depth->color) 도 사라져 고fps 수집 비용/용량이 크게 준다")
+    ap.add_argument("--rs-fps", type=int, default=30,
+                    help="RealSense 스트림 fps. D405 는 640x480 에서 90 까지 네이티브 지원")
+    ap.add_argument("--rs-json", default=None,
+                    help="RealSense advanced-mode JSON 경로. 미지정 시 "
+                         "config/realsense_d405_advanced.json")
     ap.add_argument("--fisheye-devs", default="",
                     help="팔별 어안 디바이스(쉼표; /dev/videoN 또는 인덱스). "
                          "빈칸=RealSense 와 같은 USB 허브에서 자동 매핑")
+    ap.add_argument("--pose-backend", choices=("survive", "steamvr"), default="survive",
+                    help="포즈 백엔드: survive=libsurvive(GUI 불필요, 기본), "
+                         "steamvr=OpenVR(SteamVR 실행 필요). 월드 원점이 서로 다르므로 "
+                         "한 데이터셋 안에서 섞지 말 것(HDF5 attrs pose_frame/pose_backend 로 구분)")
     ap.add_argument("--require-pose", action="store_true",
-                    help="SteamVR/OpenVR pose와 active tracker pose가 유효하지 않으면 시작하지 않음")
+                    help="포즈 백엔드와 active tracker pose가 유효하지 않으면 시작하지 않음")
     ap.add_argument("--require-all-trackers", action="store_true",
                     help="설정된 tracker-sns가 모두 보이지 않으면 시작하지 않음")
     ap.add_argument("--pose-valid-timeout", type=float, default=2.0,
@@ -590,10 +611,6 @@ def main():
                     help="그리퍼 캘리브레이션 재시도 횟수")
     ap.add_argument("--skip-gripper-calib", action="store_true",
                     help="skip startup gripper open/close calibration (tracker-only captures; nominal open/closed)")
-    ap.add_argument("--view", choices=["none", "web", "spawn"], default="none",
-                    help="rerun 라이브 뷰어(뷰 전용): web=브라우저, spawn=네이티브 창, none=끔")
-    ap.add_argument("--view-img-every", type=int, default=3, help="뷰어 카메라 로깅 간격(프레임)")
-    ap.add_argument("--view-mem", default="2GB", help="뷰어 메모리 상한(초과 시 오래된 데이터 폐기)")
     ap.add_argument("--save-max-pending", type=int, default=2,
                     help="저장 worker의 최대 pending 에피소드 수(active 포함). 2=저장 중 1개 + 대기 1개")
     ap.add_argument("--encode-workers", type=int, default=0,
@@ -633,18 +650,11 @@ def main():
     log.info("[out] 로그 파일: %s", os.path.join(session_dir, "collect.log"))
 
     arms = build_arms(a)
-    viewer = None
-    try:
-        viewer = make_viewer(a.view, memory_limit=a.view_mem, img_every=a.view_img_every,
-                             session_dir=session_dir,
-                             arm_names=[arm.name for arm in arms])
-    except Exception:
-        log.exception("[viewer] 초기화 실패")
-        raise
-
     rec = EpisodeRecorder(out_dir=session_dir, arms=arms, record_hz=a.hz,
                           use_realsense=not a.no_realsense,
                           use_fisheye=not a.no_fisheye,
+                          use_depth=not a.no_depth,
+                          rs_fps=a.rs_fps, rs_json=a.rs_json,
                           require_pose=a.require_pose,
                           require_all_trackers=a.require_all_trackers,
                           pose_valid_timeout=a.pose_valid_timeout,
@@ -652,7 +662,8 @@ def main():
                           png_depth_compression=(
                               None if a.png_depth_compression < 0 else a.png_depth_compression),
                           encode_workers=(None if a.encode_workers <= 0 else a.encode_workers),
-                          arm_bolt_colors=a.arm_bolt_colors)
+                          arm_bolt_colors=a.arm_bolt_colors,
+                          pose_backend=a.pose_backend)
     log.info("[collect] arm_bolt_colors=%s (per-session bolt assignment -> HDF5 attr)", a.arm_bolt_colors)
     log.info("[save] max_pending=%d encode_workers=%d png_compression=%d depth_png=%s",
              max(1, a.save_max_pending), rec.encode_workers, rec.png_compression,
@@ -679,8 +690,6 @@ def main():
             log.info("[gesture][%s] enter_closed=%.1f enter_open=%.1f dir=%+.0f window=%.1fs min_gap=%.0fms",
                      name, det.enter_closed, det.enter_open, det.dir, det.double_window, det.min_pinch_gap * 1e3)
     except BaseException:
-        if viewer is not None:
-            viewer.close()
         rec.stop()
         writer.close()
         raise
@@ -864,15 +873,6 @@ def main():
             else:
                 saveq.log_status()
 
-            # ---- 라이브 뷰어(뷰 전용, 팔별, 비활성 시 no-op) ----
-            if viewer.enabled:
-                per_arm = [(names[ai], fr["arms"][ai]["gripper"][0], dets[ai].is_closed) for ai in range(n)]
-                viewer_elapsed = (now - rec_t0) if recording and rec_t0 > 0.0 else 0.0
-                viewer.state(recording, ep, saved, viewer_elapsed, per_arm)
-                for ai in range(n):
-                    viewer.pose(names[ai], fr["arms"][ai]["pose"], recording)
-                    viewer.images(names[ai], fr["arms"][ai])
-
             # ---- REC 진행 로그: 팔별 각도 변동폭 vs 임계 비교(채터/오트리거 진단) ----
             if recording and a.hb > 0 and tick - last_hb >= a.hb:
                 rec_elapsed = (now - rec_t0) if rec_t0 > 0.0 else 0.0
@@ -933,7 +933,6 @@ def main():
                      names[ai], d.n_close, d.n_open, d.nan_count)
         pedal.close()
         keyboard.close()
-        viewer.close()
         rec.stop()
         run_lock.release()
 

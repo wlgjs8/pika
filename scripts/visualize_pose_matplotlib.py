@@ -2,7 +2,7 @@
 """matplotlib 기반 실시간 트래커 포즈 3D 시각화 — rerun 뷰어가 안 될 때의 확실한 대안.
 
 네이티브 GUI 창(TkAgg)을 사용하므로 wgpu/그래픽 백엔드 문제 영향이 적다.
-실행: conda run -n pika python scripts\\visualize_pose_matplotlib.py
+실행: .venv/bin/python scripts/visualize_pose_matplotlib.py
 종료: 창 닫기 또는 Ctrl-C
 """
 import os

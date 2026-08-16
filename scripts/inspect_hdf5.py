@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """기록된 에피소드 HDF5 검수 — 구조/shape/attrs 출력 + 첫 프레임 디코드 미리보기 저장.
 
-실행: conda run -n pika python scripts\\inspect_hdf5.py <path.hdf5>
+실행: .venv/bin/python scripts/inspect_hdf5.py <path.hdf5>
 """
 import os
 import sys

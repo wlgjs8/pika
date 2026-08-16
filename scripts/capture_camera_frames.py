@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """카메라 인덱스별 프레임 1장 캡처 -> PNG 저장 (어안 vs RealSense-RGB 식별용).
 
-실행: conda run -n pika python scripts\\capture_camera_frames.py
+실행: .venv/bin/python scripts/capture_camera_frames.py
 """
 import os
 import sys

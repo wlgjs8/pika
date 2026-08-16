@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
-from .pose_steamvr import PoseSteamVR
+from .pose import BACKEND_LABELS, make_pose_reader
 from .realsense_win import RealSenseD4xx
 from .fisheye import FisheyeCamera, resolve_fisheye_node
 
@@ -69,8 +69,9 @@ class EpisodeRecorder:
 
     def __init__(self, out_dir, arms=None, record_hz=30, jpeg_quality=90,
                  use_pose=True, use_sense=True, use_realsense=True, use_fisheye=True,
+                 use_depth=True, rs_fps=30, rs_json=None,
                  settle=1.0, require_pose=False, require_all_trackers=False,
-                 pose_valid_timeout=2.0, pose_tip_frame=False,
+                 pose_valid_timeout=2.0, pose_tip_frame=False, pose_backend="survive",
                  png_compression=1, png_depth_compression=None, encode_workers=None,
                  arm_bolt_colors="right=black,left=gray",
                  # ---- 레거시 단일-팔 호환 kwargs (arms 미지정 시 사용) ----
@@ -93,13 +94,22 @@ class EpisodeRecorder:
             self.encode_workers = max(1, int(encode_workers))
         self.flags = dict(pose=use_pose, sense=use_sense, realsense=use_realsense,
                           fisheye=use_fisheye)
+        # RealSense depth 스트림/fps/advanced-json. depth 를 끄면 스트림뿐 아니라
+        # rs.align(depth->color) 도 사라져 고fps 수집에서 프레임당 비용이 줄고,
+        # 저장 용량도 크게 준다(90fps 는 color 만으로도 ~93MB/s).
+        self.use_depth = bool(use_depth)
+        self.rs_fps = int(rs_fps)
+        self.rs_json = rs_json
         self.settle = settle
         self.require_pose = bool(require_pose)
         self.require_all_trackers = bool(require_all_trackers)
         self.pose_valid_timeout = float(pose_valid_timeout)
         # True 시 PIKA SDK 공식 트래커→그리퍼 팁 변환을 적용해 발행/기록
-        # (pose_steamvr.apply_tip_transform 참조)
+        # (pose_math.apply_tip_transform 참조)
         self.pose_tip_frame = bool(pose_tip_frame)
+        # 포즈 백엔드: "survive"(libsurvive, GUI 불필요) / "steamvr"(OpenVR).
+        # 백엔드마다 월드 원점이 다르므로 에피소드 attrs 에 함께 기록한다.
+        self.pose_backend = str(pose_backend)
         # 세션 단위 볼트-색 배정: 각 팔이 이번 세션에서 집는 볼트 색 (예: "right=black,left=gray"=normal,
         # "right=gray,left=black"=swap). 매 에피소드 HDF5 root attr `arm_bolt_colors`로 기록 →
         # 변환기가 색-grounded 프롬프트를 배정. 미지정/레거시 데이터는 normal(right=black,left=gray)로 간주.
@@ -117,18 +127,26 @@ class EpisodeRecorder:
 
     # ---------------- lifecycle ----------------
     def start(self):
-        # 1) 포즈(SteamVR) 1개만 연결 — 모든 트래커가 공유
+        # 1) 포즈 리더 1개만 연결 — 모든 트래커가 공유
         if self.flags["pose"]:
             try:
-                self.pose = PoseSteamVR(
-                    target_hz=250, apply_gripper_offset=self.pose_tip_frame).connect()
-                log.info("[pose] SteamVR 연결 (frame=%s)",
+                self.pose = make_pose_reader(
+                    self.pose_backend, target_hz=250,
+                    apply_gripper_offset=self.pose_tip_frame,
+                    # 설정된 트래커가 전부 붙을 때까지 기다린다 — libsurvive 는 기기별
+                    # 획득 시각이 달라서, 안 기다리면 양팔 세션이 한쪽만 잡고 시작한다.
+                    warmup_expect=self._configured_tracker_sns()).connect()
+                log.info("[pose] %s 연결 (frame=%s)", BACKEND_LABELS.get(self.pose_backend,
+                                                                        self.pose_backend),
                          "gripper_tip" if self.pose_tip_frame else "tracker_raw")
             except Exception as e:
-                log.error("[pose] SteamVR/OpenVR 연결 실패: %s", e)
+                log.error("[pose] %s 연결 실패: %s", self.pose_backend, e)
                 self.pose = None
                 if self.require_pose:
-                    raise RuntimeError("[pose] SteamVR/OpenVR 연결 실패 — SteamVR 실행 및 openvr 경로 확인") from e
+                    hint = ("libsurvive 빌드/hidraw 권한(81-vive.rules)과 베이스스테이션 전원 확인"
+                            if self.pose_backend == "survive"
+                            else "SteamVR 실행 및 openvr 경로 확인")
+                    raise RuntimeError(f"[pose] {self.pose_backend} 연결 실패 — {hint}") from e
         elif self.require_pose:
             raise RuntimeError("[pose] --require-pose 는 --no-pose 모드와 함께 사용할 수 없습니다.")
 
@@ -156,8 +174,12 @@ class EpisodeRecorder:
         if self.flags["realsense"]:
             for io in self.active:
                 s = io.spec
-                io.rs = RealSenseD4xx(serial=(s.realsense_sn or None)).connect()
-                log.info("[%s] realsense %s connected", s.name, s.realsense_sn or "(auto)")
+                io.rs = RealSenseD4xx(serial=(s.realsense_sn or None), fps=self.rs_fps,
+                                      json_path=self.rs_json,
+                                      use_depth=self.use_depth).connect()
+                log.info("[%s] realsense %s connected (%dfps, depth=%s)", s.name,
+                         s.realsense_sn or "(auto)", self.rs_fps,
+                         "on" if self.use_depth else "off")
         if self.flags["fisheye"]:
             for io in self.active:
                 s = io.spec
@@ -185,6 +207,18 @@ class EpisodeRecorder:
     def _raise_start_error(self, message):
         self.stop()
         raise RuntimeError(message)
+
+    def pose_frame_attrs(self):
+        """에피소드 attrs 로 나갈 (pose_frame, pose_backend). 저장 경로가 둘이라 여기 한 곳에만 둔다.
+
+        동기 경로(write_episode)와 비동기 writer 경로(build_payload → episode_writer)가
+        각자 이름을 계산하면 갈라진다 — 실제로 비동기 쪽이 steamvr_world 를 하드코딩한 채
+        남아 있어서 `make run` 수집분이 libsurvive 인데도 steamvr 로 라벨링됐다.
+        """
+        world = "survive_world" if self.pose_backend == "survive" else "steamvr_world"
+        if self.pose_tip_frame:
+            world += "_gripper_tip"
+        return world, BACKEND_LABELS.get(self.pose_backend, self.pose_backend)
 
     def _configured_tracker_sns(self):
         return [s.tracker_sn for s in self.arms_cfg if s.tracker_sn]
@@ -337,7 +371,8 @@ class EpisodeRecorder:
         if io.rs is not None:
             c, d, _ = io.rs.get_frames()
             arm["realsense_color"] = c
-            arm["realsense_depth"] = d
+            if d is not None:
+                arm["realsense_depth"] = d
         # 어안 카메라(raw fisheye → 저장 시 PNG)
         if io.fisheye is not None:
             fc, _ = io.fisheye.get_frame()
@@ -401,9 +436,13 @@ class EpisodeRecorder:
                 "command": [f["arms"][ai]["command"] for f in frames_c],
                 "images": images,
             })
+        pose_frame, pose_backend = self.pose_frame_attrs()
         return {
             "record_hz": self.record_hz,
             "pose_tip_frame": self.pose_tip_frame,
+            # writer 프로세스가 이름을 다시 계산하지 않도록 확정값을 실어 보낸다.
+            "pose_frame": pose_frame,
+            "pose_backend": pose_backend,
             "arm_bolt_colors": self.arm_bolt_colors,
             "names": names,
             "ts": [f["ts"] for f in frames_c],
@@ -454,6 +493,10 @@ class EpisodeRecorder:
             for k in ("width", "height", "fx", "fy", "ppx", "ppy", "model"):
                 sub.attrs[k] = intr[k]
             sub.create_dataset("coeffs", data=_np.asarray(intr["coeffs"], _np.float64))
+        # depth 를 끈 수집분은 depth 관련 항목이 없다 → intrinsics 만 쓰고 빠진다.
+        if "depth_to_color_rotation" not in calib:
+            cc.attrs["depth_aligned_to_color"] = bool(calib.get("depth_aligned_to_color", False))
+            return
         # column-major 9 -> 실제 3x3 회전행렬 (p_color = R @ p_depth + t)
         R = _np.asarray(calib["depth_to_color_rotation"], _np.float64).reshape((3, 3), order="F")
         cc.create_dataset("depth_to_color_rotation", data=R)
@@ -486,9 +529,10 @@ class EpisodeRecorder:
             with h5py.File(tmp_path, "w") as h:
                 h.attrs["record_hz"] = self.record_hz
                 h.attrs["effective_hz"] = eff
-                # tip frame: 동일 world 에서 포즈 원점만 트래커→그리퍼 팁(공식 변환)으로 이동
-                h.attrs["pose_frame"] = (
-                    "steamvr_world_gripper_tip" if self.pose_tip_frame else "steamvr_world")
+                # tip frame: 동일 world 에서 포즈 원점만 트래커→그리퍼 팁(공식 변환)으로 이동.
+                # world 원점은 백엔드마다 다르다(libsurvive 자체 scene solve vs SteamVR
+                # standing universe) → frame 이름에 백엔드를 실어 섞이지 않게 한다.
+                h.attrs["pose_frame"], h.attrs["pose_backend"] = self.pose_frame_attrs()
                 h.attrs["pose_format"] = "x,y,z,qx,qy,qz,qw"
                 h.attrs["n_arms"] = n
                 h.attrs["arm_names"] = ",".join(names)

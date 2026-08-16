@@ -2,7 +2,7 @@
 """SteamVR 포즈의 (1) 달성 가능 폴링 Hz, (2) 실제 갱신(값 변화) Hz 측정.
 
 PIKA SDK 대비 어느 레이트까지 가능한지 확인용.
-실행: conda run -n pika python scripts\\measure_pose_hz.py
+실행: .venv/bin/python scripts/measure_pose_hz.py
 정확한 '갱신 Hz'를 보려면 측정 중 트래커를 살살 움직이세요(정지 시 값이 반복되어 과소측정됨).
 """
 import sys

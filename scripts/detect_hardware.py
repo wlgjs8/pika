@@ -6,7 +6,7 @@
   - RealSense 장치 시리얼 (pyrealsense2 context)
   - Windows COM 또는 Linux /dev/serial/by-id, /dev/ttyUSB 포트 목록
 
-실행: conda run -n pika python scripts\\detect_hardware.py
+실행: .venv/bin/python scripts/detect_hardware.py
 """
 import glob
 import os

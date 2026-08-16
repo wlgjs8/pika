@@ -21,25 +21,28 @@ log = logging.getLogger("pika.fisheye")
 
 
 def _hub_of(port):
-    """RealSense physical_port / by-path 문자열에서 USB 루트 허브 포트 번호 추출.
+    """RealSense physical_port / by-path 문자열에서 (PCI 컨트롤러, 루트 포트) 추출.
 
-    버스 번호(usb1/usb2/...)에 무관하게 루트 포트를 뽑는다.
-    physical_port(sysfs): '/sys/.../usb2/2-3/2-3.2/...'   -> '3'
-    legacy(usb1):         '/sys/.../usb1/1-10/1-10.2/...'  -> '10'
-    by-path:              'pci-...-usb-0:10.1:1.0-video...' -> '10'
+    반환은 by-path 링크에 그대로 대조할 수 있는 접두 문자열이다.
+      physical_port(sysfs): '/sys/.../0000:79:00.4/usb10/10-1/10-1.2/...'
+        -> 'pci-0000:79:00.4-usb-0:1.'
+      by-path:              'pci-0000:13:00.0-usb-0:3.1.1:1.0-video...'
+        -> 'pci-0000:13:00.0-usb-0:3.'
+
+    **PCI 주소를 반드시 포함해야 한다.** xHCI 컨트롤러가 둘 이상이면 루트 포트
+    번호만으로는 구분이 안 된다(컨트롤러 A의 포트 1과 B의 포트 1이 둘 다 'usb-0:1.'
+    에 매칭 → 정렬상 앞선 쪽의 카메라를 잘못 집는다). 한 RealSense 의 USB3 버스와
+    짝 어안의 USB2 버스는 버스 번호는 다르지만 같은 PCI 주소를 공유하므로
+    이 접두는 두 스트림을 정확히 같은 물리 포트로 묶는다.
     """
     if not port:
         return None
-    # sysfs: 'usb<bus>/<bus>-<rootport>[/...]' (예: usb2/2-3 -> '3')
-    m = re.search(r"usb\d+/\d+-(\d+)", port)
+    # sysfs: '.../<pci_addr>/usb<bus>/<bus>-<rootport>[/...]'
+    m = re.search(r"(0000:[0-9a-f]{2}:[0-9a-f]{2}\.\d)/usb\d+/\d+-(\d+)", port)
     if m:
-        return m.group(1)
-    # '<bus>-<rootport>.' (예: 1-10.2, 2-3.2)
-    m = re.search(r"(?:^|[/-])\d+-(\d+)\.", port)
-    if m:
-        return m.group(1)
-    # by-path video link: 'usb-0:<rootport>.<...>'
-    m = re.search(r"usb-0:(\d+)\.", port)
+        return f"pci-{m.group(1)}-usb-0:{m.group(2)}."
+    # 이미 by-path 형태: 'pci-<addr>-usb-0:<rootport>.<...>'
+    m = re.search(r"(pci-0000:[0-9a-f]{2}:[0-9a-f]{2}\.\d-usb-0:\d+\.)", port)
     if m:
         return m.group(1)
     return None
@@ -58,16 +61,16 @@ def _v4l_name(dev):
 def resolve_fisheye_node(realsense_port, model_hint="DECXIN"):
     """RealSense 의 USB 허브와 같은 허브에 물린 어안 카메라 capture 노드(/dev/videoN) 반환.
 
-    같은 허브(by-path usb-0:<hub>.*) + 모델명이 model_hint 인 video-index0 노드를 찾는다.
-    없으면 None. (Windows/by-path 미존재 환경에서도 None)
+    같은 컨트롤러·같은 루트 포트(_hub_of 접두) + 모델명이 model_hint 인
+    video-index0 노드를 찾는다. 없으면 None. (Windows/by-path 미존재 환경에서도 None)
     """
     if os.name == "nt":
         return None
-    hub = _hub_of(realsense_port)
-    if not hub:
+    prefix = _hub_of(realsense_port)
+    if not prefix:
         return None
     for link in sorted(glob.glob("/dev/v4l/by-path/*-video-index0")):
-        if f"usb-0:{hub}." not in link:
+        if prefix not in link:
             continue
         dev = os.path.realpath(link)
         name = _v4l_name(dev)

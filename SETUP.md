@@ -1,53 +1,47 @@
 # PIKA Sense 데이터 수집 — 셋업 & 진행 계획 (Windows 네이티브 / Ubuntu Python HDF5)
 
 > 대상: AgileX **PIKA Sense** (어안 RGB + RealSense 뎁스 + Vive Tracker 6DoF + 그리퍼 각도 + IMU)
-> 추적: **Vive/SteamVR Lighthouse 2.0** + Vive Tracker 3.0 (동글 무선)
-> 실행 환경: **Windows 네이티브 또는 Ubuntu Linux + conda env `pika` (Python 3.10)**
-> 포즈: **SteamVR + pyopenvr** (공식 SDK의 pysurvive/libsurvive 경로 대체)
+> 추적: **Lighthouse 2.0 베이스스테이션 3대** + Vive Tracker (Sense 케이블로 **유선 USB**)
+> 실행 환경: **Ubuntu Linux + 저장소 로컬 `.venv` (Python 3.10)** — conda 불필요
+> 포즈: **libsurvive (기본, 헤드리스)** / SteamVR + pyopenvr (`--pose-backend steamvr`)
 > 수집 포맷: **HDF5 / ACT**
+
+> **문서 상태 (2026-08-16)**: 아래 "왜 Windows 네이티브인가" 이하는 **Windows 시절의 이력**입니다.
+> 현재 운영 환경은 Ubuntu + libsurvive이며, 실행 방법은 `README.md`가 최신입니다.
+> 특히 아래 본문의 `conda`, `/dev/serial/by-id/...`, "SteamVR 우선" 서술은 더 이상 유효하지 않습니다.
 
 ---
 
-## Ubuntu 오프라인 수집 경로
+## Ubuntu 수집 경로 (현행, 2026-08-16 이관 완료)
 
 `robotics_lab/policy_runner flow-train`과 바로 맞추는 1차 경로는 ROS가
-아니라 이 디렉터리의 Python HDF5 수집기다. Ubuntu에서는 다음 순서로
-검증한다.
+아니라 이 디렉터리의 Python HDF5 수집기다. 설치·실행 절차는 `README.md`에 있고,
+여기서는 이관하며 확정된 사실만 남긴다.
 
-1. Python 환경:
-   ```bash
-   conda create -y -n pika python=3.10
-   conda run -n pika python -m pip install pyserial numpy opencv-python h5py pyrealsense2 openvr pillow
-   conda run -n pika python -m pip install --no-deps agx-pypika
-   ```
-2. 장치 확인:
-   ```bash
-   conda run -n pika python scripts/detect_hardware.py
-   ```
-   Linux에서는 `config/arms.json`의 `com_port`에 `COM3` 대신
-   `/dev/serial/by-id/...` 경로를 쓰는 것을 권장한다.
-3. 좌/우 매핑 고정:
-   ```bash
-   conda run -n pika python scripts/identify_arms.py
-   ```
-4. 수집:
-   ```bash
-   conda run -n pika python scripts/collect.py --hz 30
-   ```
-   기존 Windows `config/arms.json`을 무시하고 CLI 포트를 쓰려면
-   `--config '' --coms /dev/serial/by-id/<right>,/dev/serial/by-id/<left>`를
-   지정한다.
-5. `robotics_lab` flow 학습 smoke:
-   ```bash
-   cd /home/plaif/workspace/robotics_lab
-   PYTHONPATH=policy_runner python3 -m policy_runner flow-train \
-     --episodes-dir /home/plaif/workspace/pai_rectified_flow_matching/pika/data \
-     --checkpoint outputs/flow_policy.pt \
-     --epochs 1 --batch-size 1 --device cpu
-   ```
-
-현재 수집기는 OpenVR/SteamVR 포즈를 우선 사용한다. SteamVR이 Ubuntu에서
-불안정하면 libsurvive 기반 포즈 백엔드는 별도 어댑터로 추가해야 한다.
+- **포즈 백엔드는 libsurvive가 기본**이다. SteamVR은 GUI가 떠야 해서 배제했다.
+  libsurvive는 `survive-cli`/`pysurvive` 모두 헤드리스로 동작한다.
+  덤으로, PIKA SDK의 트래커→팁 보정 `R_corr`은 원래 libsurvive raw frame 기준으로
+  정의된 값이라(`pika/tracker/vive_tracker.py`), 이 백엔드에서는 OpenVR 경로가
+  달고 있던 "두 body frame이 같다"는 **미검증 가정이 필요 없다**.
+- **업스트림 libsurvive에는 치명적 버그가 있다.** USB 전송 에러가 나면 transfer를
+  재제출한 뒤 성공/실패와 무관하게 disconnect 경로로 떨어져, 방금 띄운 in-flight
+  transfer를 free 한다(use-after-free) → libusb assertion으로 프로세스 전체가 abort.
+  `patches/libsurvive-0001-*.patch`가 이를 고치며 `scripts/setup_libsurvive.sh`가
+  멱등하게 적용한다. **이 패치 없이는 수집 중 USB 글리치 한 번에 에피소드가 날아간다.**
+- libsurvive 옵션명은 `--config`가 아니라 **`--configfile`** 이다. `--config`는 조용히
+  무시되고 해가 `~/.config/libsurvive/config.json`에 저장된다(공식 PIKA SDK도 이 함정에
+  빠져 있다). 라이트하우스 해는 `config/libsurvive_config.json`에 고정한다.
+- 캘리브레이션은 **트래커를 움직이며** 해야 수렴한다. 정지 상태로는 scene solve가 발산해
+  라이트하우스가 16~17 m 거리에 variance 수백으로 잡히고 포즈도 수십 m로 나온다.
+- 장치 경로는 **`by-path` 전용**이다. `by-id`는 이 리그(CH340 4개·DECXIN 4개·발판 2개)에서
+  구조적으로 깨진다 — README의 경고 절 참고.
+- 월드 원점이 SteamVR과 다르므로 에피소드는 `pose_frame=survive_world`,
+  `pose_backend=libsurvive`로 라벨링되고, robotics_lab 변환은 전용 retarget
+  (`calibration/umi_retarget_eelocal_survive.yaml`)을 쓴다. 기존 `steamvr_world`
+  코퍼스(약 930 에피소드)와 **섞이지 않도록 umi-convert가 불일치를 거부한다.**
+- 라이브 teleop은 월드 프레임에 **불변**이다. 타깃 합성이
+  `target = arm_init · (pika_init⁻¹ · pika_now)` 인 body-relative라 전역 회전이 상쇄된다.
+  즉 백엔드 교체가 조작 방향을 바꾸지 않는다.
 
 ## 왜 Windows 네이티브인가 (WSL2에서 전환)
 WSL2/usbipd 경로는 두 하드웨어 전선에서 막혔다:

@@ -21,7 +21,7 @@ CSV: '#' 메타 주석 몇 줄 + 헤더 1줄 + 데이터.  (pandas: read_csv(...
   트래커 미검출 side 는 valid=0 + 빈 필드.
 
 실행(.40, SteamVR 실행 + 트래커 + 발판 연결):
-  conda run -n pika python scripts/umi_pose_log_csv.py --pedal-device auto
+  .venv/bin/python scripts/umi_pose_log_csv.py --pedal-device auto
 키보드 폴백(발판 없이 테스트): --no-pedal 이면 시작 즉시 기록.
 """
 import argparse

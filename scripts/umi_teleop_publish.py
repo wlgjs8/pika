@@ -33,7 +33,7 @@ deadman(클러치)은 PikaAnyArm 트리거와 동일한 토글 의미:
   키보드 키로 토글 (Windows msvcrt / Linux cbreak). 좌/우 개별 또는 공유.
 
 실행(Windows, SteamVR 실행 + 트래커 + Sense 연결):
-  conda run -n pika python scripts\\umi_teleop_publish.py \
+  .venv/bin/python scripts/umi_teleop_publish.py \
     --target-host 192.168.8.x --left-port 50380 --right-port 50381
 
 키: [space]=양팔 클러치 토글, [a]=좌팔, [l]=우팔, [q]=종료.
@@ -53,6 +53,7 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
+from pika_win.pedal import find_pedal_devices, open_pedal  # noqa: E402
 from pika_win.sdk_logging import quiet_pika_sdk_info  # noqa: E402
 
 log = logging.getLogger("pika.umi_teleop")
@@ -293,12 +294,20 @@ class PedalClutch:
     EV_KEY = 0x01
     EVENT = struct.Struct("llHHi")  # input_event: timeval(2 long) + type + code + value
 
-    def __init__(self, device="auto", toggle=False, debounce_sec=0.05):
+    def __init__(self, device="auto", toggle=False, debounce_sec=0.05, grab=True,
+                 mute_others=False):
         self.device_arg = device
         self.toggle = bool(toggle)
         self.debounce_sec = max(0.0, float(debounce_sec))
-        self.fd = None
-        self.path = None
+        # 기본 배타 점유: 안 하면 발판이 키보드로도 동작해 포커스된 창/터미널에
+        # 'b' 를 계속 입력한다(PCsensor 기본 키맵 + X11 오토리피트 → 밟고 있는 동안 도배).
+        self.grab = bool(grab)
+        # 클러치로 쓰지 않는 나머지 발판까지 점유해 키 누수만 막는다(이벤트는 안 읽음).
+        self.mute_others = bool(mute_others)
+        self._mute_fds = []
+        self.fds = {}            # path -> fd (발판이 여러 개면 전부 수신)
+        self.path = None         # 표시용(여러 개면 쉼표 결합)
+        self._raw_by_fd = {}     # fd -> 그 장치의 raw 눌림 상태
         self.held = False        # momentary: 발판 눌림 상태(디바운스 후 committed)
         self.engaged_both = False  # toggle: 누적 상태
         self.quit = False        # 인터페이스 호환(발판엔 종료 키 없음)
@@ -308,50 +317,101 @@ class PedalClutch:
         self._raw_held = False
         self._last_edge_mono = 0.0
 
-    def _resolve_device(self):
+    find_devices = staticmethod(find_pedal_devices)
+
+    def _resolve_devices(self):
         if self.device_arg not in ("auto", ""):
-            return self.device_arg
-        cands = sorted(glob.glob("/dev/input/by-id/*FootSwitch*event-kbd")) or \
-            sorted(glob.glob("/dev/input/by-id/*[Ff]oot[Ss]witch*event-kbd"))
-        return cands[0] if cands else None
+            return [p.strip() for p in self.device_arg.split(",") if p.strip()]
+        found = self.find_devices()
+        if len(found) > 1:
+            # 발판이 여러 개면 **자동 선택하지 않는다.** 이 PC 는 teleop 용 1구 발판과
+            # robotics_lab(rb_gui InitMotion) 용 3구 발판을 함께 쓰는데, 둘은 VID:PID·
+            # evdev capability 가 완전히 동일해 물리 포트(by-path) 말고는 구별할 수단이
+            # 없다. 잘못 고르면 robotics_lab 발판을 밟았을 때 teleop 클러치가 걸려
+            # 로봇이 움직인다 → 모호하면 기동을 거부하는 쪽이 안전하다.
+            raise RuntimeError(
+                "발판이 여러 개 감지되어 자동 선택할 수 없습니다(VID:PID·capability 동일). "
+                "--pedal-device 로 하나를 지정하세요:\n  " + "\n  ".join(found) +
+                "\n어느 것이 어느 발판인지는 `python scripts/pedal_test.py` 로 확인하세요.")
+        return found
 
     def start(self):
-        path = self._resolve_device()
-        if not path:
-            raise RuntimeError("FootSwitch evdev 장치를 찾지 못함 (/dev/input/by-id/*FootSwitch*event-kbd). "
-                               "--pedal-device 로 직접 지정하거나 권한(input 그룹) 확인.")
-        try:
-            self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        except PermissionError as e:
-            raise RuntimeError(f"{path} 읽기 권한 없음 ({e}). 'sudo usermod -aG input $USER' 후 재로그인 또는 udev 규칙 필요.")
-        self.path = path
+        paths = self._resolve_devices()
+        if not paths:
+            raise RuntimeError(
+                "FootSwitch evdev 장치를 찾지 못함. `python scripts/pedal_test.py` 로 "
+                "장치를 확인하거나 --pedal-device 로 직접 지정하고, 권한(plugdev 그룹 / "
+                "udev 99-footswitch.rules)을 확인하세요.")
+        errors = []
+        for path in paths:
+            try:
+                fd = open_pedal(path, grab=self.grab)
+            except OSError as e:
+                errors.append(f"{path}: {e}")
+                continue
+            self.fds[path] = fd
+            self._raw_by_fd[fd] = False
+        if not self.fds:
+            raise RuntimeError("발판 evdev 열기 실패 — " + "; ".join(errors) +
+                               ". 'sudo usermod -aG plugdev $USER' 후 재로그인이 필요할 수 있습니다.")
+        self.path = ",".join(self.fds)
+        if self.mute_others:
+            self._mute_other_pedals()
+        if len(self.fds) > 1:
+            # 여러 발판을 동시에 수신한다(어느 것을 밟아도 클러치가 걸린다).
+            # 한 개만 쓰려면 --pedal-device 로 경로를 지정할 것.
+            log.info("[umi] 발판 %d개 동시 수신: %s", len(self.fds), self.path)
+        if errors:
+            log.warning("[umi] 일부 발판을 열지 못함: %s", "; ".join(errors))
         return self
+
+    def _mute_other_pedals(self):
+        """클러치로 안 쓰는 나머지 발판을 점유만 해서 키 누수를 막는다(이벤트는 안 읽음).
+
+        이 리그의 3구 발판은 robotics_lab rb_gui 전용이라 평소엔 rb_gui 가 점유한다.
+        발행자만 단독 실행하면 아무도 안 잡아서, 그 발판을 밟는 동안 X11 오토리피트로
+        터미널이 'bbbb...' 로 도배된다. rb_gui 가 이미 잡고 있으면 여기 grab 은 실패하는데,
+        그건 이미 막혀 있다는 뜻이므로 정상이다(경고만 남기고 넘어간다).
+        """
+        mine = {os.path.realpath(p) for p in self.fds}
+        for path in find_pedal_devices():
+            if os.path.realpath(path) in mine:
+                continue
+            try:
+                self._mute_fds.append(open_pedal(path, grab=True))
+                log.info("[umi] 발판 키 누수 차단(점유만): %s", path)
+            except OSError as e:
+                log.warning("[umi] %s 누수 차단 실패: %s", path, e)
 
     def update(self):
         now = time.monotonic()
         # 쌓인 이벤트를 모두 소비해 raw 키 상태 갱신(바운스 edge 포함).
         # raw 가 바뀔 때마다 _last_edge_mono 를 갱신 → 바운스 동안엔 계속 리셋.
-        while True:
-            try:
-                data = os.read(self.fd, self.EVENT.size * 64)
-            except BlockingIOError:
-                break
-            except OSError:
-                break
-            if not data:
-                break
-            usable = len(data) - (len(data) % self.EVENT.size)
-            for off in range(0, usable, self.EVENT.size):
-                _, _, etype, _code, value = self.EVENT.unpack_from(data, off)
-                if etype != self.EV_KEY:
-                    continue
-                if value == 1 and not self._raw_held:      # 누름 edge
-                    self._raw_held = True
-                    self._last_edge_mono = now
-                elif value == 0 and self._raw_held:        # 뗌 edge
-                    self._raw_held = False
-                    self._last_edge_mono = now
-                # value==2(오토리피트)·동일값 반복은 무시
+        for fd in list(self._raw_by_fd):
+            while True:
+                try:
+                    data = os.read(fd, self.EVENT.size * 64)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    break
+                if not data:
+                    break
+                usable = len(data) - (len(data) % self.EVENT.size)
+                for off in range(0, usable, self.EVENT.size):
+                    _, _, etype, _code, value = self.EVENT.unpack_from(data, off)
+                    if etype != self.EV_KEY:
+                        continue
+                    if value == 1:
+                        self._raw_by_fd[fd] = True
+                    elif value == 0:
+                        self._raw_by_fd[fd] = False
+                    # value==2(오토리피트)·동일값 반복은 무시
+        # 여러 발판 중 하나라도 눌려 있으면 눌린 것으로 본다.
+        raw_any = any(self._raw_by_fd.values())
+        if raw_any != self._raw_held:
+            self._raw_held = raw_any
+            self._last_edge_mono = now
         # raw 상태가 debounce_sec 동안 안정되면 commit. toggle 은 commit 된
         # 누름 edge(상승)에서만 누적 상태를 뒤집는다 → 바운스로 인한 다중 토글 제거.
         if self._raw_held != self.held and (now - self._last_edge_mono) >= self.debounce_sec:
@@ -363,12 +423,14 @@ class PedalClutch:
         return {"left": on, "right": on}
 
     def close(self):
-        if self.fd is not None:
+        for fd in list(self._raw_by_fd) + self._mute_fds:
             try:
-                os.close(self.fd)
+                os.close(fd)
             except OSError:
                 pass
-            self.fd = None
+        self.fds.clear()
+        self._raw_by_fd.clear()
+        self._mute_fds.clear()
 
 
 # ----------------------------- arms.json 로더 (collect.build_arms 의 최소 버전) -----------------------------
@@ -431,13 +493,9 @@ def selftest():
     assert normalize_gripper(5, 0, 0) is None  # 범위 미확정
     # (그리퍼 추종 클램프/데드밴드/레이트리밋 판단은 robotics_lab/scripts/
     #  umi_gripper_follow.py 로 이전 — 해당 selftest 도 그쪽에 있음)
-    # 트래커→그리퍼 팁 공식 변환 (openvr 모듈 임포트만 필요 — SteamVR 불필요)
-    try:
-        from pika_win.pose_steamvr import (
-            TIP_ROTATION_QUAT, TIP_TRANSLATION, apply_tip_transform, quat_rotate_vec)
-    except ImportError as exc:
-        print(f"selftest OK (tip-transform 검증 생략: {exc})")
-        return
+    # 트래커→그리퍼 팁 공식 변환 (pose_math 는 백엔드 중립 — openvr/pysurvive 불필요)
+    from pika_win.pose_math import (
+        TIP_ROTATION_QUAT, TIP_TRANSLATION, apply_tip_transform, quat_rotate_vec)
     # raw 항등 포즈 → 원점은 raw frame 레버암 R_corr·t = [0, -0.0126, +0.1876] 로 이동
     pos, quat = apply_tip_transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
     expect = quat_rotate_vec(TIP_ROTATION_QUAT, TIP_TRANSLATION)
@@ -480,6 +538,9 @@ def get_arguments():
     ap.add_argument("--both-key", default=" ")
     ap.add_argument("--swap-lr", action="store_true",
                     help="좌/우 트래커↔로봇팔 매핑을 스왑(로봇을 마주보고 조작할 때 미러)")
+    ap.add_argument("--pose-backend", choices=("survive", "steamvr"), default="survive",
+                    help="포즈 백엔드: survive=libsurvive(GUI 불필요, 기본), "
+                         "steamvr=OpenVR(SteamVR 실행 필요)")
     ap.add_argument("--pose-frame", choices=("tip", "tracker"), default="tip",
                     help="발행 포즈 원점: tip=PIKA 공식 그리퍼 팁 변환 적용(기본, "
                          "URDF 팁 TCP와 짝), tracker=raw 트래커 원점(구 동작)")
@@ -487,6 +548,14 @@ def get_arguments():
                     help="USB 발판(FootSwitch)을 클러치로 사용(키보드 대신, stdin 무의존)")
     ap.add_argument("--pedal-device", default="auto",
                     help="발판 evdev 경로(기본 auto=/dev/input/by-id/*FootSwitch*event-kbd)")
+    ap.add_argument("--mute-other-pedals", action="store_true",
+                    help="클러치로 안 쓰는 나머지 발판까지 점유해 키 누수를 막는다(이벤트는 "
+                         "읽지 않음). robotics_lab 을 같이 띄우면 rb_gui 가 자기 발판을 이미 "
+                         "점유하므로 불필요하다. 발행자만 단독 실행할 때 쓸 것 — 이 상태에서 "
+                         "rb_gui 를 나중에 띄우면 그쪽 발판이 비활성된다")
+    ap.add_argument("--no-pedal-grab", dest="pedal_grab", action="store_false",
+                    help="발판 배타 점유(EVIOCGRAB) 비활성. 기본은 점유해서 발판 키가 "
+                         "터미널/창으로 새는 것을 막는다. 진단용으로만 끌 것")
     ap.add_argument("--pedal-toggle", action="store_true",
                     help="발판을 밟을 때마다 토글(기본은 밟는 동안만 engage하는 momentary)")
     ap.add_argument("--pedal-debounce-sec", type=float, default=0.05,
@@ -518,13 +587,14 @@ def main():
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(message)s")
     quiet_pika_sdk_info(show_parse_errors=a.show_sdk_parse_errors)
-    from pika_win.recorder import EpisodeRecorder  # openvr 의존 — main 안에서 지연 임포트
+    from pika_win.recorder import EpisodeRecorder  # 포즈 백엔드 의존 — main 안에서 지연 임포트
 
     arms = load_arms(a.config)
     rec = EpisodeRecorder(out_dir=os.path.join(REPO_ROOT, "data", "_umi_teleop_tmp"),
                           arms=arms, use_realsense=False, use_fisheye=False, use_sense=not a.no_sense,
                           use_pose=True, require_pose=True,
-                          pose_tip_frame=(a.pose_frame == "tip"))
+                          pose_tip_frame=(a.pose_frame == "tip"),
+                          pose_backend=a.pose_backend)
     rec.start()
     names = rec.arm_names()
     log.info("[umi] 활성 팔: %s  pose_frame=%s", names,
@@ -542,9 +612,12 @@ def main():
 
     if a.pedal:
         clutch = PedalClutch(a.pedal_device, toggle=a.pedal_toggle,
-                             debounce_sec=a.pedal_debounce_sec).start()
+                             debounce_sec=a.pedal_debounce_sec,
+                             grab=a.pedal_grab,
+                             mute_others=a.mute_other_pedals).start()
         mode = "토글(밟을 때마다)" if a.pedal_toggle else "momentary(밟는 동안)"
-        log.info("[umi] 발판 클러치: %s  device=%s  (%s)", "ON", clutch.path, mode)
+        log.info("[umi] 발판 클러치: %s  device=%s  (%s, %s)", "ON", clutch.path, mode,
+                 "배타 점유" if a.pedal_grab else "점유 안 함(키가 터미널로 샘)")
     else:
         clutch = KeyboardClutch(a.left_key, a.right_key, a.both_key).start()
         if a.start_engaged:

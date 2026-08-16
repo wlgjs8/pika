@@ -3,7 +3,7 @@
 
 WSL/libsurvive에서 실패했던 포즈 추적을, Windows의 SteamVR 경로로 대체해 검증한다.
 - 전제: SteamVR가 실행 중(헤드리스 설정), 동글이 Windows에 연결, 트래커 전원 ON + 페어링됨.
-- 실행: conda run -n pika python scripts\\pose_test_openvr.py
+- 실행: .venv/bin/python scripts/pose_test_openvr.py
 - 포즈 포맷: position (x,y,z) [m] + quaternion (x,y,z,w)  ← PIKA SDK와 동일 포맷
 """
 import sys
@@ -13,7 +13,7 @@ import math
 try:
     import openvr
 except ImportError:
-    sys.exit("openvr 미설치: conda activate pika 후 pip install openvr")
+    sys.exit("openvr 미설치: .venv 에 pip install openvr (SteamVR 백엔드용)")
 
 CLASS_NAMES = {
     openvr.TrackedDeviceClass_HMD: "HMD",
