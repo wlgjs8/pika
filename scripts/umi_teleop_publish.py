@@ -294,13 +294,17 @@ class PedalClutch:
     EV_KEY = 0x01
     EVENT = struct.Struct("llHHi")  # input_event: timeval(2 long) + type + code + value
 
-    def __init__(self, device="auto", toggle=False, debounce_sec=0.05, grab=True):
+    def __init__(self, device="auto", toggle=False, debounce_sec=0.05, grab=True,
+                 mute_others=False):
         self.device_arg = device
         self.toggle = bool(toggle)
         self.debounce_sec = max(0.0, float(debounce_sec))
         # 기본 배타 점유: 안 하면 발판이 키보드로도 동작해 포커스된 창/터미널에
-        # 'b' 를 계속 입력한다(PCsensor 기본 키맵).
+        # 'b' 를 계속 입력한다(PCsensor 기본 키맵 + X11 오토리피트 → 밟고 있는 동안 도배).
         self.grab = bool(grab)
+        # 클러치로 쓰지 않는 나머지 발판까지 점유해 키 누수만 막는다(이벤트는 안 읽음).
+        self.mute_others = bool(mute_others)
+        self._mute_fds = []
         self.fds = {}            # path -> fd (발판이 여러 개면 전부 수신)
         self.path = None         # 표시용(여러 개면 쉼표 결합)
         self._raw_by_fd = {}     # fd -> 그 장치의 raw 눌림 상태
@@ -351,6 +355,8 @@ class PedalClutch:
             raise RuntimeError("발판 evdev 열기 실패 — " + "; ".join(errors) +
                                ". 'sudo usermod -aG plugdev $USER' 후 재로그인이 필요할 수 있습니다.")
         self.path = ",".join(self.fds)
+        if self.mute_others:
+            self._mute_other_pedals()
         if len(self.fds) > 1:
             # 여러 발판을 동시에 수신한다(어느 것을 밟아도 클러치가 걸린다).
             # 한 개만 쓰려면 --pedal-device 로 경로를 지정할 것.
@@ -358,6 +364,24 @@ class PedalClutch:
         if errors:
             log.warning("[umi] 일부 발판을 열지 못함: %s", "; ".join(errors))
         return self
+
+    def _mute_other_pedals(self):
+        """클러치로 안 쓰는 나머지 발판을 점유만 해서 키 누수를 막는다(이벤트는 안 읽음).
+
+        이 리그의 3구 발판은 robotics_lab rb_gui 전용이라 평소엔 rb_gui 가 점유한다.
+        발행자만 단독 실행하면 아무도 안 잡아서, 그 발판을 밟는 동안 X11 오토리피트로
+        터미널이 'bbbb...' 로 도배된다. rb_gui 가 이미 잡고 있으면 여기 grab 은 실패하는데,
+        그건 이미 막혀 있다는 뜻이므로 정상이다(경고만 남기고 넘어간다).
+        """
+        mine = {os.path.realpath(p) for p in self.fds}
+        for path in find_pedal_devices():
+            if os.path.realpath(path) in mine:
+                continue
+            try:
+                self._mute_fds.append(open_pedal(path, grab=True))
+                log.info("[umi] 발판 키 누수 차단(점유만): %s", path)
+            except OSError as e:
+                log.warning("[umi] %s 누수 차단 실패: %s", path, e)
 
     def update(self):
         now = time.monotonic()
@@ -399,13 +423,14 @@ class PedalClutch:
         return {"left": on, "right": on}
 
     def close(self):
-        for fd in self._raw_by_fd:
+        for fd in list(self._raw_by_fd) + self._mute_fds:
             try:
                 os.close(fd)
             except OSError:
                 pass
         self.fds.clear()
         self._raw_by_fd.clear()
+        self._mute_fds.clear()
 
 
 # ----------------------------- arms.json 로더 (collect.build_arms 의 최소 버전) -----------------------------
@@ -523,6 +548,11 @@ def get_arguments():
                     help="USB 발판(FootSwitch)을 클러치로 사용(키보드 대신, stdin 무의존)")
     ap.add_argument("--pedal-device", default="auto",
                     help="발판 evdev 경로(기본 auto=/dev/input/by-id/*FootSwitch*event-kbd)")
+    ap.add_argument("--mute-other-pedals", action="store_true",
+                    help="클러치로 안 쓰는 나머지 발판까지 점유해 키 누수를 막는다(이벤트는 "
+                         "읽지 않음). robotics_lab 을 같이 띄우면 rb_gui 가 자기 발판을 이미 "
+                         "점유하므로 불필요하다. 발행자만 단독 실행할 때 쓸 것 — 이 상태에서 "
+                         "rb_gui 를 나중에 띄우면 그쪽 발판이 비활성된다")
     ap.add_argument("--no-pedal-grab", dest="pedal_grab", action="store_false",
                     help="발판 배타 점유(EVIOCGRAB) 비활성. 기본은 점유해서 발판 키가 "
                          "터미널/창으로 새는 것을 막는다. 진단용으로만 끌 것")
@@ -583,7 +613,8 @@ def main():
     if a.pedal:
         clutch = PedalClutch(a.pedal_device, toggle=a.pedal_toggle,
                              debounce_sec=a.pedal_debounce_sec,
-                             grab=a.pedal_grab).start()
+                             grab=a.pedal_grab,
+                             mute_others=a.mute_other_pedals).start()
         mode = "토글(밟을 때마다)" if a.pedal_toggle else "momentary(밟는 동안)"
         log.info("[umi] 발판 클러치: %s  device=%s  (%s, %s)", "ON", clutch.path, mode,
                  "배타 점유" if a.pedal_grab else "점유 안 함(키가 터미널로 샘)")
