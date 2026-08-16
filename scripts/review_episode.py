@@ -218,6 +218,16 @@ class Episode:
     def duration(self):
         return float(self.ts[-1] - self.ts[0]) if self.n > 1 else 0.0
 
+    @property
+    def rate(self):
+        """타임스탬프에서 구한 실제 수집 레이트(Hz).
+
+        에피소드 attrs 의 effective_hz 를 쓰지 않는다 — recorder 가 그것을
+        `프레임수 / 구간` 으로 계산하는데 간격 개수는 `프레임수-1` 이라 0.4% 정도
+        과대평가된다(277프레임/9.241s: attr 29.98 vs 실제 29.87).
+        """
+        return (self.n - 1) / self.duration if self.n > 1 and self.duration > 0 else 0.0
+
     def _decode(self, arm, key, idx):
         ds = self.h5.get(f"{arm['base']}/images/{key}")
         if ds is None or idx < 0 or idx >= len(ds):
@@ -282,7 +292,7 @@ def _stream_title(key):
 
 
 def _compose(ep, idx, cell_w, cell_h, show_help, achieved_fps=0.0,
-             speed=1.0, playing=False):
+             speed=1.0, playing=False, fixed_fps=None):
     """팔=행, 스트림=열 격자 + 하단 상태줄."""
     rows = []
     for arm in ep.arms:
@@ -298,8 +308,8 @@ def _compose(ep, idx, cell_w, cell_h, show_help, achieved_fps=0.0,
     grid = np.vstack(rows)
 
     # ---- 상태줄: 팔별 pose/gripper ----
-    rec_hz = ep.attrs.get("effective_hz")
-    rec_txt = f"rec {float(rec_hz):.1f}Hz" if rec_hz else ""
+    rec_txt = (f"고정 {fixed_fps:.1f}fps 기준" if fixed_fps
+               else f"수집 {ep.rate:.2f}Hz 기준")
     lines = [
         f"{ep.session}/{ep.name}   frame {idx + 1}/{ep.n}   "
         f"t={ep.ts[idx] - ep.ts[0]:6.2f}s / {ep.duration:.2f}s   "
@@ -351,7 +361,9 @@ def main():
     ap.add_argument("--streams", help="표시할 스트림(쉼표): color,fisheye,depth. 기본: 전부")
     ap.add_argument("--cell-width", type=int, default=420, help="셀 하나의 가로 픽셀")
     ap.add_argument("--cell-height", type=int, default=315, help="셀 하나의 세로 픽셀")
-    ap.add_argument("--fps", type=float, default=30.0, help="재생 fps")
+    ap.add_argument("--fps", type=float, default=None,
+                    help="재생 fps 를 이 값으로 고정. 기본은 파일의 타임스탬프를 그대로 "
+                         "따라 수집 당시 속도로 재생(정확한 1배속)")
     ap.add_argument("--start-paused", action="store_true", default=True,
                     help="일시정지 상태로 시작(기본)")
     ap.add_argument("--play", dest="start_paused", action="store_false",
@@ -403,15 +415,39 @@ def main():
     cv2.createTrackbar("frame", WINDOW, 0, 1, on_track)
     open_episode(start)
 
-    last = time.perf_counter()
-    shown = last
+    def et(i):
+        """프레임 i 의 에피소드 내 경과 시간(초).
+
+        기본은 **파일에 기록된 타임스탬프**를 그대로 쓴다 → 수집 당시 속도로 정확히 1배속
+        재생된다(이 리그 실측 프레임간격 33.46ms = 29.87Hz, 명목 30 과 미세하게 다르다).
+        --fps 를 주면 그 값으로 균일 간격을 만들어 쓴다.
+        """
+        i = max(0, min(int(i), ep.n - 1))
+        return i / a.fps if a.fps else float(ep.ts[i] - ep.ts[0])
+
+    # 재생 기준점(앵커). 재생 시작·탐색·에피소드 전환·배속 변경마다 다시 잡는다.
+    # 이걸 안 하면 일시정지 동안 흐른 시간이 그대로 '밀린 재생분'으로 남아, 재생을 누른
+    # 순간 밀린 만큼 프레임을 몰아서 넘기며 고속 되감기처럼 튄다.
+    anchor_wall = time.perf_counter()
+    anchor_t = et(idx)
+
+    def reanchor():
+        nonlocal anchor_wall, anchor_t
+        anchor_wall, anchor_t = time.perf_counter(), et(idx)
+
+    shown = anchor_wall
     achieved = 0.0
+    prev_idx, prev_playing, prev_speed = idx, playing, speed
     try:
         while True:
-            period = 1.0 / max(1e-3, a.fps * speed)
+            # 프레임/배속/재생상태가 바깥에서 바뀌었으면 앵커를 다시 잡는다(트랙바 포함).
+            if idx != prev_idx or playing != prev_playing or speed != prev_speed:
+                reanchor()
+                prev_idx, prev_playing, prev_speed = idx, playing, speed
+
             ep.prefetch(idx + 1 if playing else idx)   # 표시 중에 다음 프레임 디코드
             canvas = _compose(ep, idx, a.cell_width, a.cell_height, show_help,
-                              achieved, speed, playing)
+                              achieved, speed, playing, a.fps)
             cv2.imshow(WINDOW, canvas)
 
             now = time.perf_counter()
@@ -419,9 +455,13 @@ def main():
                 inst = 1.0 / max(1e-6, now - shown)
                 achieved = 0.8 * achieved + 0.2 * inst if achieved else inst
             shown = now
-            # **렌더에 쓴 시간을 대기에서 뺀다.** 빼지 않으면 waitKey(period) 가 렌더 시간
-            # 위에 그대로 더해져 30Hz 수집분이 절반 속도로 재생된다(실측 15fps).
-            wait_ms = int((last + period - now) * 1000) if playing else 20
+            # 다음 프레임이 나와야 할 벽시계 시각까지만 기다린다(렌더에 쓴 시간은 자동으로
+            # 빠진다). 뒤처졌으면 음수가 되어 1ms 로 클램프 → 프레임을 건너뛰며 따라잡는다.
+            if playing and idx + 1 < ep.n:
+                due = anchor_wall + (et(idx + 1) - anchor_t) / speed
+                wait_ms = int((due - now) * 1000)
+            else:
+                wait_ms = 20
             key = cv2.waitKey(max(1, wait_ms)) & 0xFF
 
             if key in (ord("q"), 27):
@@ -453,19 +493,21 @@ def main():
                 _log(f"saved {out}")
 
             if playing:
-                now = time.perf_counter()
-                if now - last >= period:
-                    # 렌더가 period 보다 오래 걸리면 뒤처진 만큼 배수로 진행하되(드리프트
-                    # 방지), 한 번에 몰아서 튀지 않게 상한을 둔다.
-                    steps = min(int((now - last) / period), 4)
-                    last += steps * period
-                    if idx + steps < ep.n:
-                        idx += steps
-                    elif ep_idx + 1 < len(paths):
-                        open_episode(ep_idx + 1)   # 다음 에피소드로 이어서
-                        last = time.perf_counter()
+                # 앵커 기준 '지금 보여야 할' 에피소드 시각까지 프레임을 진행한다.
+                # 렌더가 느려 뒤처지면 프레임을 건너뛸 뿐, 시간축은 늘어나지 않는다.
+                target_t = anchor_t + (time.perf_counter() - anchor_wall) * speed
+                nxt = idx
+                while nxt + 1 < ep.n and et(nxt + 1) <= target_t:
+                    nxt += 1
+                if nxt != idx:
+                    idx = prev_idx = nxt          # 여기서 진행한 것은 재앵커 대상이 아니다
+                elif idx + 1 >= ep.n and target_t > et(ep.n - 1):
+                    if ep_idx + 1 < len(paths):
+                        open_episode(ep_idx + 1)  # 다음 에피소드로 이어서
+                        prev_idx = idx
+                        reanchor()
                     else:
-                        idx, playing = ep.n - 1, False   # 마지막에서 정지
+                        playing = prev_playing = False   # 마지막에서 정지
 
             seeking["user"] = True
             cv2.setTrackbarPos("frame", WINDOW, idx)
