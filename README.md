@@ -15,7 +15,7 @@ AgileX PIKA Sense 기반 데이터 수집을 위한 Python 도구입니다. Vive
 - RealSense color/depth intrinsics·depth↔color extrinsic·stereo baseline을 에피소드에 저장
 - 좌/우 팔 하드웨어 매핑을 `config/arms.json`에 저장
 - `b` 키 또는 Linux FootSwitch 입력으로 에피소드 녹화 시작/정지
-- 수집 데이터 분석, HDF5 구조 확인, 브라우저 기반 에피소드 리뷰
+- 수집 데이터 분석, HDF5 구조 확인, 로컬 OpenCV 창 기반 에피소드 리뷰
 
 ## 디렉터리 구조
 
@@ -224,26 +224,36 @@ JSON 출력:
 .venv/bin/python scripts/analyze_data.py data --latest --json
 ```
 
-### 6. 에피소드 리뷰
+### 6. 에피소드 리뷰 (로컬 OpenCV 창)
 
-최신 세션을 브라우저에서 리뷰:
+최신 세션의 모든 에피소드를 순서대로 검수:
 
 ```bash
-.venv/bin/python scripts/review_episode.py
+./scripts/run_review_episode.sh
 ```
 
 특정 세션 또는 에피소드 지정:
 
 ```bash
-.venv/bin/python scripts/review_episode.py --session data/data_YYYYMMDD_HHMMSS
-.venv/bin/python scripts/review_episode.py --episode data/data_YYYYMMDD_HHMMSS/episode_000.hdf5
+./scripts/run_review_episode.sh --session data/data_YYYYMMDD_HHMMSS
+./scripts/run_review_episode.sh --episode data/data_YYYYMMDD_HHMMSS/episode_000.hdf5
+./scripts/run_review_episode.sh --arms left --streams color,depth   # 일부만
 ```
 
-서버를 띄우지 않고 HTML 파일만 생성:
+팔=행, 스트림(D405 color / 어안 / depth)=열로 배치하고 하단에 프레임 번호·경과 시간·
+`pose_frame`·팔별 pose/gripper 를 표시합니다. HDF5 에서 **직접 디코드**하므로 JPEG 에셋
+추출이나 HTTP 서버가 없습니다(예전 HTML 리뷰어는 13 에피소드 빌드에 2분 이상 걸렸고
+세션마다 수백 MB 의 `review_session/` 을 남겼습니다).
 
-```bash
-.venv/bin/python scripts/review_episode.py --no-serve
-```
+| 키 | 동작 | 키 | 동작 |
+|---|---|---|---|
+| `space` | 재생/일시정지 | `.` `,` | 다음/이전 프레임 |
+| `]` `[` | 다음/이전 에피소드 | `+` `-` | 재생 속도 |
+| `g` `e` | 첫/마지막 프레임 | `s` | 현재 화면 PNG 저장 |
+| `h` | 도움말 토글 | `q` / `ESC` | 종료 |
+
+트랙바로도 탐색할 수 있습니다. 재생 중 에피소드 끝에 닿으면 다음 에피소드로 이어집니다.
+로컬 모니터가 있는 세션에서 실행해야 하며, `DISPLAY` 가 없으면 안내 후 종료합니다.
 
 ### 7. HDF5 구조 확인
 
@@ -314,7 +324,7 @@ make run PY="conda run --no-capture-output -n pika python"   # conda 환경을 �
 ```bash
 ./scripts/run_collect_fast.sh     # 헤드리스 수집 (뷰어 없음, 최대 처리량)
 ./scripts/run_collect_web.sh      # 브라우저 뷰어와 함께 수집
-./scripts/run_review_episode.sh   # 에피소드 리뷰 서버 (기본 8088)
+./scripts/run_review_episode.sh   # 에피소드 리뷰 (로컬 OpenCV 창)
 ./scripts/analyze_data.sh data --latest
 PY="conda run --no-capture-output -n pika python" ./scripts/run_collect_web.sh
 ```

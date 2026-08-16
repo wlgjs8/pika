@@ -5,14 +5,19 @@ cd "$(dirname "$0")/.."
 # shellcheck source=scripts/_venv.sh
 source scripts/_venv.sh
 
-# 리뷰 서버 URL 에 광고할 LAN IP. 예전 수집 PC(172.28.60.40) 하드코딩을 제거했다 —
-# 필요할 때만 지정하고, 없으면 자동 탐지한다.
-if [[ -n "${PIKA_VIEW_LAN_IPS:-}" ]]; then
-  export PIKA_VIEW_LAN_IPS
+# 로컬 OpenCV 창으로 에피소드를 검수한다(HTTP 서버/HTML 생성 없음).
+# 원격 셸에서 실행할 때를 위해 X 디스플레이를 보정한다.
+if [[ -z "${DISPLAY:-}" && -S /tmp/.X11-unix/X0 ]]; then
+  export DISPLAY=:0
+fi
+if [[ -z "${XAUTHORITY:-}" && -r "$HOME/.Xauthority" ]]; then
+  export XAUTHORITY="$HOME/.Xauthority"
 fi
 
-PORT="${PIKA_REVIEW_PORT:-8088}"
+if [[ -z "${DISPLAY:-}" ]]; then
+  echo "[review] DISPLAY 가 없습니다 — OpenCV 창을 띄울 수 없습니다." >&2
+  echo "[review] 로컬 모니터가 붙은 세션에서 실행하거나 DISPLAY=:0 을 지정하세요." >&2
+  exit 1
+fi
 
-exec "${PY_CMD[@]}" scripts/review_episode.py \
-  --port "$PORT" \
-  "$@"
+exec "${PY_CMD[@]}" scripts/review_episode.py "$@"
