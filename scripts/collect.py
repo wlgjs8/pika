@@ -567,8 +567,12 @@ def main():
     ap.add_argument("--fisheye-devs", default="",
                     help="팔별 어안 디바이스(쉼표; /dev/videoN 또는 인덱스). "
                          "빈칸=RealSense 와 같은 USB 허브에서 자동 매핑")
+    ap.add_argument("--pose-backend", choices=("survive", "steamvr"), default="survive",
+                    help="포즈 백엔드: survive=libsurvive(GUI 불필요, 기본), "
+                         "steamvr=OpenVR(SteamVR 실행 필요). 월드 원점이 서로 다르므로 "
+                         "한 데이터셋 안에서 섞지 말 것(HDF5 attrs pose_frame/pose_backend 로 구분)")
     ap.add_argument("--require-pose", action="store_true",
-                    help="SteamVR/OpenVR pose와 active tracker pose가 유효하지 않으면 시작하지 않음")
+                    help="포즈 백엔드와 active tracker pose가 유효하지 않으면 시작하지 않음")
     ap.add_argument("--require-all-trackers", action="store_true",
                     help="설정된 tracker-sns가 모두 보이지 않으면 시작하지 않음")
     ap.add_argument("--pose-valid-timeout", type=float, default=2.0,
@@ -652,7 +656,8 @@ def main():
                           png_depth_compression=(
                               None if a.png_depth_compression < 0 else a.png_depth_compression),
                           encode_workers=(None if a.encode_workers <= 0 else a.encode_workers),
-                          arm_bolt_colors=a.arm_bolt_colors)
+                          arm_bolt_colors=a.arm_bolt_colors,
+                          pose_backend=a.pose_backend)
     log.info("[collect] arm_bolt_colors=%s (per-session bolt assignment -> HDF5 attr)", a.arm_bolt_colors)
     log.info("[save] max_pending=%d encode_workers=%d png_compression=%d depth_png=%s",
              max(1, a.save_max_pending), rec.encode_workers, rec.png_compression,

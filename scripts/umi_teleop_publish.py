@@ -297,8 +297,9 @@ class PedalClutch:
         self.device_arg = device
         self.toggle = bool(toggle)
         self.debounce_sec = max(0.0, float(debounce_sec))
-        self.fd = None
-        self.path = None
+        self.fds = {}            # path -> fd (발판이 여러 개면 전부 수신)
+        self.path = None         # 표시용(여러 개면 쉼표 결합)
+        self._raw_by_fd = {}     # fd -> 그 장치의 raw 눌림 상태
         self.held = False        # momentary: 발판 눌림 상태(디바운스 후 committed)
         self.engaged_both = False  # toggle: 누적 상태
         self.quit = False        # 인터페이스 호환(발판엔 종료 키 없음)
@@ -308,50 +309,114 @@ class PedalClutch:
         self._raw_held = False
         self._last_edge_mono = 0.0
 
-    def _resolve_device(self):
+    @staticmethod
+    def find_devices():
+        """연결된 FootSwitch 키보드 evdev 경로 전부(sysfs 이름 기준, 정렬).
+
+        **by-id 를 쓰면 안 된다.** 발판 2개는 VID:PID 가 같고 시리얼이 없어서 udev 가
+        이름 충돌을 피하려고 `/dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd` 를
+        먼저 잡힌 하나에만 만든다. 나머지 발판은 by-id 에 아예 나타나지 않아
+        구조적으로 인식이 불가능하다. sysfs 의 device/name 으로 직접 찾는다.
+        """
+        # eventN -> by-path 역인덱스. by-path 는 물리 USB 포트 기반이라 발판이 여러 개여도
+        # 충돌하지 않고 재부팅/재연결에도 안정적이다(eventN 번호는 바뀐다).
+        by_path = {}
+        for link in glob.glob("/dev/input/by-path/*-event-kbd"):
+            try:
+                by_path[os.path.realpath(link)] = link
+            except OSError:
+                continue
+        kbd, other = [], []
+        for d in sorted(glob.glob("/sys/class/input/event*")):
+            try:
+                with open(os.path.join(d, "device", "name"), encoding="utf-8") as f:
+                    name = f.read().strip()
+            except OSError:
+                continue
+            low = name.lower()
+            if "footswitch" not in low or "mouse" in low:
+                continue
+            node = "/dev/input/" + os.path.basename(d)
+            (kbd if "keyboard" in low else other).append(by_path.get(node, node))
+        # 발판 하나가 Keyboard/Mouse/보조 HID 3개 노드를 만든다. **Keyboard 노드만** 쓴다.
+        # 보조 노드는 press 만 보내고 release 를 안 보낼 수 있는데, deadman 클러치에서
+        # 그러면 눌림 상태가 True 로 고착돼 클러치가 영구 engage 된다(안전 문제).
+        # Keyboard 노드가 하나도 없는 모델을 대비해서만 보조 노드로 폴백한다.
+        return sorted(kbd or other)
+
+    def _resolve_devices(self):
         if self.device_arg not in ("auto", ""):
-            return self.device_arg
-        cands = sorted(glob.glob("/dev/input/by-id/*FootSwitch*event-kbd")) or \
-            sorted(glob.glob("/dev/input/by-id/*[Ff]oot[Ss]witch*event-kbd"))
-        return cands[0] if cands else None
+            return [p.strip() for p in self.device_arg.split(",") if p.strip()]
+        found = self.find_devices()
+        if len(found) > 1:
+            # 발판이 여러 개면 **자동 선택하지 않는다.** 이 PC 는 teleop 용 1구 발판과
+            # robotics_lab(rb_gui InitMotion) 용 3구 발판을 함께 쓰는데, 둘은 VID:PID·
+            # evdev capability 가 완전히 동일해 물리 포트(by-path) 말고는 구별할 수단이
+            # 없다. 잘못 고르면 robotics_lab 발판을 밟았을 때 teleop 클러치가 걸려
+            # 로봇이 움직인다 → 모호하면 기동을 거부하는 쪽이 안전하다.
+            raise RuntimeError(
+                "발판이 여러 개 감지되어 자동 선택할 수 없습니다(VID:PID·capability 동일). "
+                "--pedal-device 로 하나를 지정하세요:\n  " + "\n  ".join(found) +
+                "\n어느 것이 어느 발판인지는 `python scripts/pedal_test.py` 로 확인하세요.")
+        return found
 
     def start(self):
-        path = self._resolve_device()
-        if not path:
-            raise RuntimeError("FootSwitch evdev 장치를 찾지 못함 (/dev/input/by-id/*FootSwitch*event-kbd). "
-                               "--pedal-device 로 직접 지정하거나 권한(input 그룹) 확인.")
-        try:
-            self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        except PermissionError as e:
-            raise RuntimeError(f"{path} 읽기 권한 없음 ({e}). 'sudo usermod -aG input $USER' 후 재로그인 또는 udev 규칙 필요.")
-        self.path = path
+        paths = self._resolve_devices()
+        if not paths:
+            raise RuntimeError(
+                "FootSwitch evdev 장치를 찾지 못함. `python scripts/pedal_test.py` 로 "
+                "장치를 확인하거나 --pedal-device 로 직접 지정하고, 권한(plugdev 그룹 / "
+                "udev 99-footswitch.rules)을 확인하세요.")
+        errors = []
+        for path in paths:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as e:
+                errors.append(f"{path}: {e}")
+                continue
+            self.fds[path] = fd
+            self._raw_by_fd[fd] = False
+        if not self.fds:
+            raise RuntimeError("발판 evdev 열기 실패 — " + "; ".join(errors) +
+                               ". 'sudo usermod -aG plugdev $USER' 후 재로그인이 필요할 수 있습니다.")
+        self.path = ",".join(self.fds)
+        if len(self.fds) > 1:
+            # 여러 발판을 동시에 수신한다(어느 것을 밟아도 클러치가 걸린다).
+            # 한 개만 쓰려면 --pedal-device 로 경로를 지정할 것.
+            log.info("[umi] 발판 %d개 동시 수신: %s", len(self.fds), self.path)
+        if errors:
+            log.warning("[umi] 일부 발판을 열지 못함: %s", "; ".join(errors))
         return self
 
     def update(self):
         now = time.monotonic()
         # 쌓인 이벤트를 모두 소비해 raw 키 상태 갱신(바운스 edge 포함).
         # raw 가 바뀔 때마다 _last_edge_mono 를 갱신 → 바운스 동안엔 계속 리셋.
-        while True:
-            try:
-                data = os.read(self.fd, self.EVENT.size * 64)
-            except BlockingIOError:
-                break
-            except OSError:
-                break
-            if not data:
-                break
-            usable = len(data) - (len(data) % self.EVENT.size)
-            for off in range(0, usable, self.EVENT.size):
-                _, _, etype, _code, value = self.EVENT.unpack_from(data, off)
-                if etype != self.EV_KEY:
-                    continue
-                if value == 1 and not self._raw_held:      # 누름 edge
-                    self._raw_held = True
-                    self._last_edge_mono = now
-                elif value == 0 and self._raw_held:        # 뗌 edge
-                    self._raw_held = False
-                    self._last_edge_mono = now
-                # value==2(오토리피트)·동일값 반복은 무시
+        for fd in list(self._raw_by_fd):
+            while True:
+                try:
+                    data = os.read(fd, self.EVENT.size * 64)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    break
+                if not data:
+                    break
+                usable = len(data) - (len(data) % self.EVENT.size)
+                for off in range(0, usable, self.EVENT.size):
+                    _, _, etype, _code, value = self.EVENT.unpack_from(data, off)
+                    if etype != self.EV_KEY:
+                        continue
+                    if value == 1:
+                        self._raw_by_fd[fd] = True
+                    elif value == 0:
+                        self._raw_by_fd[fd] = False
+                    # value==2(오토리피트)·동일값 반복은 무시
+        # 여러 발판 중 하나라도 눌려 있으면 눌린 것으로 본다.
+        raw_any = any(self._raw_by_fd.values())
+        if raw_any != self._raw_held:
+            self._raw_held = raw_any
+            self._last_edge_mono = now
         # raw 상태가 debounce_sec 동안 안정되면 commit. toggle 은 commit 된
         # 누름 edge(상승)에서만 누적 상태를 뒤집는다 → 바운스로 인한 다중 토글 제거.
         if self._raw_held != self.held and (now - self._last_edge_mono) >= self.debounce_sec:
@@ -363,12 +428,13 @@ class PedalClutch:
         return {"left": on, "right": on}
 
     def close(self):
-        if self.fd is not None:
+        for fd in self._raw_by_fd:
             try:
-                os.close(self.fd)
+                os.close(fd)
             except OSError:
                 pass
-            self.fd = None
+        self.fds.clear()
+        self._raw_by_fd.clear()
 
 
 # ----------------------------- arms.json 로더 (collect.build_arms 의 최소 버전) -----------------------------
@@ -431,13 +497,9 @@ def selftest():
     assert normalize_gripper(5, 0, 0) is None  # 범위 미확정
     # (그리퍼 추종 클램프/데드밴드/레이트리밋 판단은 robotics_lab/scripts/
     #  umi_gripper_follow.py 로 이전 — 해당 selftest 도 그쪽에 있음)
-    # 트래커→그리퍼 팁 공식 변환 (openvr 모듈 임포트만 필요 — SteamVR 불필요)
-    try:
-        from pika_win.pose_steamvr import (
-            TIP_ROTATION_QUAT, TIP_TRANSLATION, apply_tip_transform, quat_rotate_vec)
-    except ImportError as exc:
-        print(f"selftest OK (tip-transform 검증 생략: {exc})")
-        return
+    # 트래커→그리퍼 팁 공식 변환 (pose_math 는 백엔드 중립 — openvr/pysurvive 불필요)
+    from pika_win.pose_math import (
+        TIP_ROTATION_QUAT, TIP_TRANSLATION, apply_tip_transform, quat_rotate_vec)
     # raw 항등 포즈 → 원점은 raw frame 레버암 R_corr·t = [0, -0.0126, +0.1876] 로 이동
     pos, quat = apply_tip_transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
     expect = quat_rotate_vec(TIP_ROTATION_QUAT, TIP_TRANSLATION)
@@ -480,6 +542,9 @@ def get_arguments():
     ap.add_argument("--both-key", default=" ")
     ap.add_argument("--swap-lr", action="store_true",
                     help="좌/우 트래커↔로봇팔 매핑을 스왑(로봇을 마주보고 조작할 때 미러)")
+    ap.add_argument("--pose-backend", choices=("survive", "steamvr"), default="survive",
+                    help="포즈 백엔드: survive=libsurvive(GUI 불필요, 기본), "
+                         "steamvr=OpenVR(SteamVR 실행 필요)")
     ap.add_argument("--pose-frame", choices=("tip", "tracker"), default="tip",
                     help="발행 포즈 원점: tip=PIKA 공식 그리퍼 팁 변환 적용(기본, "
                          "URDF 팁 TCP와 짝), tracker=raw 트래커 원점(구 동작)")
@@ -518,13 +583,14 @@ def main():
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(message)s")
     quiet_pika_sdk_info(show_parse_errors=a.show_sdk_parse_errors)
-    from pika_win.recorder import EpisodeRecorder  # openvr 의존 — main 안에서 지연 임포트
+    from pika_win.recorder import EpisodeRecorder  # 포즈 백엔드 의존 — main 안에서 지연 임포트
 
     arms = load_arms(a.config)
     rec = EpisodeRecorder(out_dir=os.path.join(REPO_ROOT, "data", "_umi_teleop_tmp"),
                           arms=arms, use_realsense=False, use_fisheye=False, use_sense=not a.no_sense,
                           use_pose=True, require_pose=True,
-                          pose_tip_frame=(a.pose_frame == "tip"))
+                          pose_tip_frame=(a.pose_frame == "tip"),
+                          pose_backend=a.pose_backend)
     rec.start()
     names = rec.arm_names()
     log.info("[umi] 활성 팔: %s  pose_frame=%s", names,

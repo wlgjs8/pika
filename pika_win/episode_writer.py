@@ -104,8 +104,15 @@ def write_episode_payload(path, payload):
         with h5py.File(tmp_path, "w") as h:
             h.attrs["record_hz"] = payload["record_hz"]
             h.attrs["effective_hz"] = eff
-            h.attrs["pose_frame"] = (
+            # pose_frame/pose_backend 는 recorder.pose_frame_attrs() 가 확정해 payload 에
+            # 실어 보낸다(계산을 두 벌 두면 갈라진다). 이 키가 없는 payload 는 트래커
+            # 백엔드가 없는 외부 생산자(robotics_lab collect_onrobot_teleop 등)뿐이고,
+            # 그쪽은 저장 후 pose_frame 을 자기 값으로 덮어쓴다 → 레거시 이름만 남기고
+            # pose_backend 는 아예 쓰지 않는다(모르는 값을 지어내지 않기 위해).
+            h.attrs["pose_frame"] = payload.get("pose_frame") or (
                 "steamvr_world_gripper_tip" if payload["pose_tip_frame"] else "steamvr_world")
+            if payload.get("pose_backend"):
+                h.attrs["pose_backend"] = payload["pose_backend"]
             h.attrs["pose_format"] = "x,y,z,qx,qy,qz,qw"
             h.attrs["n_arms"] = n
             h.attrs["arm_names"] = ",".join(names)

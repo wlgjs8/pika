@@ -1,0 +1,27 @@
+diff --git a/src/driver_vive.libusb.h b/src/driver_vive.libusb.h
+index 25007de..4bbfeb4 100644
+--- a/src/driver_vive.libusb.h
++++ b/src/driver_vive.libusb.h
+@@ -227,11 +227,18 @@ static void handle_transfer(struct libusb_transfer *transfer) {
+ 	if (!iface->shutdown && transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+ 		SV_WARN("%f %s Device disconnect: %d", survive_run_time(ctx), survive_colorize_codename(iface->assoc_obj),
+ 				transfer->status);
+-		iface->error_count++;
+-		if (iface->error_count++ < 10) {
+-			if (libusb_submit_transfer(transfer)) {
+-				goto shutdown;
++		// 재제출에 성공하면 디바이스를 살려둔 채 계속 간다.
++		// 원본은 재제출 성공/실패와 무관하게 disconnect 로 떨어졌다 → shutdown 경로가
++		// 방금 다시 띄운 in-flight transfer 를 survive_usb_transfer_free() 로 해제해
++		// use-after-free 가 되고, libusb 가 파괴된 뮤텍스를 잡으며 abort 했다
++		// (usbi_mutex_lock assertion). 그래서 재시도 로직이 사실상 죽은 코드였고
++		// 전송 에러 한 번이면 프로세스 전체가 죽었다.
++		// 또한 error_count 를 한 번의 에러에 두 번 증가시켜 재시도 예산이 절반이었다.
++		if (++iface->error_count < 10) {
++			if (libusb_submit_transfer(transfer) == 0) {
++				return;
+ 			}
++			goto shutdown;
+ 		}
+ 
+ 		goto disconnect;

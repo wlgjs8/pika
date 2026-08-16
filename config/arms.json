@@ -2,12 +2,12 @@
   "arms": {
     "right": {
       "tracker_sn": "LHR-29E2B23B",
-      "com_port": "/dev/ttyUSB0",
+      "com_port": "/dev/serial/by-path/pci-0000:13:00.0-usb-0:4.1.4:1.0-port0",
       "realsense_sn": "419122270010"
     },
     "left": {
       "tracker_sn": "LHR-40B32551",
-      "com_port": "/dev/ttyUSB1",
+      "com_port": "/dev/serial/by-path/pci-0000:79:00.4-usb-0:1.1.4:1.0-port0",
       "realsense_sn": "260522277606"
     }
   }
