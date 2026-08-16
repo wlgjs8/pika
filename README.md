@@ -11,7 +11,7 @@ AgileX PIKA Sense 기반 데이터 수집을 위한 Python 도구입니다. Vive
 - 단일 팔 또는 양팔 PIKA 데이터 수집
 - libsurvive(기본) 또는 SteamVR/OpenVR 기반 Vive Tracker 6DoF 포즈 수집
 - PIKA Sense 시리얼 그리퍼 각도/명령 수집
-- RealSense D4xx 컬러/뎁스 프레임 수집
+- RealSense D4xx 컬러/뎁스 프레임 수집 (`--no-depth` 로 color 만, `--rs-fps 90` 지원)
 - RealSense color/depth intrinsics·depth↔color extrinsic·stereo baseline을 에피소드에 저장
 - 좌/우 팔 하드웨어 매핑을 `config/arms.json`에 저장
 - `b` 키 또는 Linux FootSwitch 입력으로 에피소드 녹화 시작/정지
@@ -23,7 +23,7 @@ AgileX PIKA Sense 기반 데이터 수집을 위한 Python 도구입니다. Vive
 .
 ├── config/              # 좌/우 팔 하드웨어 매핑
 ├── data/                # 수집 결과 저장 위치, Git 제외
-├── pika_win/            # 포즈, RealSense, recorder, viewer 모듈
+├── pika_win/            # 포즈, RealSense, 어안, recorder, writer 모듈
 ├── scripts/             # 수집/검수/분석 실행 스크립트
 ├── Makefile             # 자주 쓰는 실행 명령
 ├── SETUP.md             # 하드웨어 셋업과 진행 기록
@@ -40,10 +40,9 @@ uv pip install --python .venv/bin/python pyserial numpy opencv-python h5py pyrea
 uv pip install --python .venv/bin/python --no-deps agx-pypika
 ```
 
-라이브 뷰어를 쓰면 `rerun-sdk`, SteamVR 백엔드를 쓰면 `openvr`을 추가로 설치합니다.
+SteamVR 백엔드를 쓰면 `openvr`을 추가로 설치합니다.
 
 ```bash
-uv pip install --python .venv/bin/python rerun-sdk   # make view
 uv pip install --python .venv/bin/python openvr      # --pose-backend steamvr
 ```
 
@@ -137,7 +136,7 @@ make identify
 .venv/bin/python scripts/identify_arms.py
 ```
 
-마법사의 안내에 따라 오른손/왼손 트래커, 그리퍼, RealSense를 움직이면 `config/arms.json`이 갱신됩니다. 실행 전 `collect.py`, `make run`, `make view`는 종료해야 합니다.
+마법사의 안내에 따라 오른손/왼손 트래커, 그리퍼, RealSense를 움직이면 `config/arms.json`이 갱신됩니다. 실행 전 `collect.py`, `make run`, `run_collect_fast.sh`는 종료해야 합니다.
 
 ### 3. 데이터 수집
 
@@ -147,17 +146,18 @@ make identify
 make run
 ```
 
-브라우저 라이브 뷰어와 함께 수집:
+90fps RGB-only 수집(어안·depth 비활성):
 
 ```bash
-make view
+./scripts/run_collect_fast.sh
 ```
 
 직접 실행 예시:
 
 ```bash
 .venv/bin/python scripts/collect.py --hz 30
-.venv/bin/python scripts/collect.py --view web --hz 30
+.venv/bin/python scripts/collect.py --hz 90 --rs-fps 90 --no-fisheye --no-depth \
+  --rs-json /home/plaif/workspace/robotics_lab/camera_server/config/realsense_d405_90fps.json
 ```
 
 수집이 시작되면 먼저 각 팔의 그리퍼 캘리브레이션을 수행합니다. 안내가 나오면 그리퍼를 여러 번 끝까지 쥐었다 펴세요.
@@ -328,7 +328,6 @@ camera_calib
 ```bash
 make identify   # 좌/우 팔 하드웨어 매핑 생성
 make run        # 헤드리스 데이터 수집
-make view       # rerun 라이브 뷰어와 함께 수집
 make pose-test  # 포즈 백엔드 스모크 테스트(libsurvive)
 ```
 
@@ -336,7 +335,6 @@ make pose-test  # 포즈 백엔드 스모크 테스트(libsurvive)
 
 ```bash
 make run ARGS="--hz 30 --require-pose --require-all-trackers"
-make view VIEW=web ARGS="--hz 30"
 make run PY="conda run --no-capture-output -n pika python"   # conda 환경을 쓸 때
 ```
 
@@ -346,12 +344,26 @@ make run PY="conda run --no-capture-output -n pika python"   # conda 환경을 �
 (conda 불필요). 다른 인터프리터는 `PY` 로 덮어씁니다.
 
 ```bash
-./scripts/run_collect_fast.sh     # 헤드리스 수집 (뷰어 없음, 최대 처리량)
-./scripts/run_collect_web.sh      # 브라우저 뷰어와 함께 수집
+./scripts/run_collect_fast.sh     # 90fps RGB-only 수집 (어안·depth 비활성)
 ./scripts/run_review_episode.sh   # 에피소드 리뷰 (로컬 OpenCV 창)
 ./scripts/analyze_data.sh data --latest
-PY="conda run --no-capture-output -n pika python" ./scripts/run_collect_web.sh
+PY="conda run --no-capture-output -n pika python" ./scripts/run_collect_fast.sh
 ```
+
+`run_collect_fast.sh` 는 다음을 기본으로 붙입니다:
+`--hz 90 --rs-fps 90 --rs-json <robotics_lab 90fps json> --no-fisheye --no-depth`
+
+RealSense advanced-mode JSON 은 **robotics_lab 것을 경로로 직접 참조**합니다(사본 없음 →
+그 파일 하나만 고치면 수집·추론이 함께 따라갑니다). 파일이 없으면 **즉시 실패**합니다 —
+그냥 두면 `realsense_win` 이 "advanced json 없음, 건너뜀" 으로 조용히 넘어가 카메라에 남아
+있던 직전 설정(예: AE off)으로 수집돼 버리기 때문입니다.
+
+| env | 기본 | 용도 |
+|---|---|---|
+| `RS_JSON` | robotics_lab `realsense_d405_90fps.json` | advanced-mode 프리셋 경로 |
+| `PIKA_HZ` / `PIKA_RS_FPS` | 90 / 90 | 기록 주파수 / 스트림 fps |
+| `PIKA_FISHEYE` / `PIKA_DEPTH` | 0 / 0 | `1` 로 두면 어안/depth 를 다시 켬 |
+| `PIKA_ENCODE_WORKERS` | 4 | PNG 인코딩 worker 수 |
 
 수집 래퍼는 하드웨어를 **`config/arms.json` 에서만** 읽습니다. 예전에는 `--config ''` 로
 arms.json 을 무시하고 `--coms /dev/ttyUSB0,/dev/ttyUSB1` 을 강제했는데, 그 두 포트는
@@ -378,8 +390,9 @@ TARGET_HOST=172.28.61.3 ./scripts/run_umi_teleop_publish.sh   # 별도 로봇 PC
 
 - `--hz 30`: 수집 주파수
 - `--out data`: 출력 루트 디렉터리
-- `--view web`: 브라우저 라이브 뷰어 사용
 - `--no-realsense`: RealSense 없이 수집
+- `--no-fisheye` / `--no-depth`: 어안 / depth 스트림 비활성
+- `--rs-fps 90` / `--rs-json <path>`: RealSense 스트림 fps / advanced-mode 프리셋
 - `--require-pose`: 유효한 포즈가 없으면 시작하지 않음
 - `--require-all-trackers`: 설정된 모든 트래커가 보일 때만 시작
 - `--no-pedal`: FootSwitch 입력 비활성화
@@ -439,15 +452,6 @@ MUTE_OTHER_PEDALS=0 ./scripts/run_umi_teleop_publish.sh
 (위 by-path 경고 참고). `scripts/pedal_test.py`로 밟은 발판의 by-path를 확인해
 `--pedal-device`(또는 `PEDAL_DEVICE`)로 지정하세요. robotics_lab `rb_gui`가 실행 중이면
 자기 발판을 **배타적으로 grab** 하므로 그쪽에 잡힌 발판은 여기서 반응하지 않습니다.
-
-### `make view`(web 뷰어)가 `[viewer] gRPC 서버 시작 중`에서 멈춤
-
-rerun 네이티브 `rr.serve_grpc()`가 드물게 시작 직후 리턴하지 않는 **일회성 데드락**입니다.
-포트(9876)는 LISTEN 상태로 바인딩됐지만 `gRPC 서버 시작 완료` 로그가 안 찍힙니다.
-메모리/디스크 문제가 아닙니다(동일 코드/포트로 재현되지 않는 transient race).
-
-- 조치: `Ctrl-C`로 종료 후 재실행하면 대부분 풀립니다.
-- 헤드리스 수집만 필요하면 `make run`(`--view` 없이)으로 우회할 수 있습니다.
 
 ## Git에 포함하지 않는 파일
 

@@ -69,6 +69,7 @@ class EpisodeRecorder:
 
     def __init__(self, out_dir, arms=None, record_hz=30, jpeg_quality=90,
                  use_pose=True, use_sense=True, use_realsense=True, use_fisheye=True,
+                 use_depth=True, rs_fps=30, rs_json=None,
                  settle=1.0, require_pose=False, require_all_trackers=False,
                  pose_valid_timeout=2.0, pose_tip_frame=False, pose_backend="survive",
                  png_compression=1, png_depth_compression=None, encode_workers=None,
@@ -93,6 +94,12 @@ class EpisodeRecorder:
             self.encode_workers = max(1, int(encode_workers))
         self.flags = dict(pose=use_pose, sense=use_sense, realsense=use_realsense,
                           fisheye=use_fisheye)
+        # RealSense depth 스트림/fps/advanced-json. depth 를 끄면 스트림뿐 아니라
+        # rs.align(depth->color) 도 사라져 고fps 수집에서 프레임당 비용이 줄고,
+        # 저장 용량도 크게 준다(90fps 는 color 만으로도 ~93MB/s).
+        self.use_depth = bool(use_depth)
+        self.rs_fps = int(rs_fps)
+        self.rs_json = rs_json
         self.settle = settle
         self.require_pose = bool(require_pose)
         self.require_all_trackers = bool(require_all_trackers)
@@ -167,8 +174,12 @@ class EpisodeRecorder:
         if self.flags["realsense"]:
             for io in self.active:
                 s = io.spec
-                io.rs = RealSenseD4xx(serial=(s.realsense_sn or None)).connect()
-                log.info("[%s] realsense %s connected", s.name, s.realsense_sn or "(auto)")
+                io.rs = RealSenseD4xx(serial=(s.realsense_sn or None), fps=self.rs_fps,
+                                      json_path=self.rs_json,
+                                      use_depth=self.use_depth).connect()
+                log.info("[%s] realsense %s connected (%dfps, depth=%s)", s.name,
+                         s.realsense_sn or "(auto)", self.rs_fps,
+                         "on" if self.use_depth else "off")
         if self.flags["fisheye"]:
             for io in self.active:
                 s = io.spec
@@ -360,7 +371,8 @@ class EpisodeRecorder:
         if io.rs is not None:
             c, d, _ = io.rs.get_frames()
             arm["realsense_color"] = c
-            arm["realsense_depth"] = d
+            if d is not None:
+                arm["realsense_depth"] = d
         # 어안 카메라(raw fisheye → 저장 시 PNG)
         if io.fisheye is not None:
             fc, _ = io.fisheye.get_frame()
@@ -481,6 +493,10 @@ class EpisodeRecorder:
             for k in ("width", "height", "fx", "fy", "ppx", "ppy", "model"):
                 sub.attrs[k] = intr[k]
             sub.create_dataset("coeffs", data=_np.asarray(intr["coeffs"], _np.float64))
+        # depth 를 끈 수집분은 depth 관련 항목이 없다 → intrinsics 만 쓰고 빠진다.
+        if "depth_to_color_rotation" not in calib:
+            cc.attrs["depth_aligned_to_color"] = bool(calib.get("depth_aligned_to_color", False))
+            return
         # column-major 9 -> 실제 3x3 회전행렬 (p_color = R @ p_depth + t)
         R = _np.asarray(calib["depth_to_color_rotation"], _np.float64).reshape((3, 3), order="F")
         cc.create_dataset("depth_to_color_rotation", data=R)

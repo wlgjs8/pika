@@ -28,13 +28,16 @@ def _default_advanced_json():
 
 class RealSenseD4xx:
     def __init__(self, serial=None, width=640, height=480, fps=30, align_to_color=True,
-                 json_path=None):
+                 json_path=None, use_depth=True):
         self.serial = serial
         self.width = width
         self.height = height
         self.fps = fps
         self.align_to_color = align_to_color
         self.json_path = json_path if json_path is not None else _default_advanced_json()
+        # depth 를 끄면 스트림뿐 아니라 rs.align(depth->color) 도 건너뛴다. align 은
+        # 프레임마다 도는 비용이라 고fps 수집에서 무시할 수 없다.
+        self.use_depth = bool(use_depth)
         self.pipe = None
         self.align = None
         self.physical_port = None
@@ -124,7 +127,8 @@ class RealSenseD4xx:
         cfg = rs.config()
         if self.serial:
             cfg.enable_device(str(self.serial))
-        cfg.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
+        if self.use_depth:
+            cfg.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
         cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
         profile = self.pipe.start(cfg)
         try:
@@ -132,7 +136,7 @@ class RealSenseD4xx:
         except Exception:
             self.physical_port = None
         self.calib = self._read_calibration(profile)
-        self.align = rs.align(rs.stream.color) if self.align_to_color else None
+        self.align = rs.align(rs.stream.color) if (self.align_to_color and self.use_depth) else None
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="RealSense", daemon=True)
         self._thread.start()
@@ -146,12 +150,14 @@ class RealSenseD4xx:
                 continue
             if self.align is not None:
                 frames = self.align.process(frames)
-            d = frames.get_depth_frame()
             c = frames.get_color_frame()
-            if not d or not c:
+            if not c:
+                continue
+            d = frames.get_depth_frame() if self.use_depth else None
+            if self.use_depth and not d:
                 continue
             color = np.asanyarray(c.get_data())   # HxWx3 BGR8
-            depth = np.asanyarray(d.get_data())   # HxW uint16
+            depth = np.asanyarray(d.get_data()) if d else None   # HxW uint16
             with self._lock:
                 self._color, self._depth, self._ts = color, depth, time.time()
 
@@ -169,7 +175,21 @@ class RealSenseD4xx:
         }
 
     def _read_calibration(self, profile):
-        """color/depth intrinsics + depth->color extrinsic + depth_scale (정적)."""
+        """color/depth intrinsics + depth->color extrinsic + depth_scale (정적).
+
+        depth 를 끈 경우 depth 관련 항목은 만들 수 없으므로 color intrinsics 만 담아
+        반환한다(예전에는 예외로 빠져 calib 전체가 None 이 되어 color intrinsics 까지
+        잃었다 — 수집분에서 카메라 내부파라미터가 통째로 사라지는 손실).
+        """
+        if not self.use_depth:
+            try:
+                cprof = profile.get_stream(rs.stream.color).as_video_stream_profile()
+                return {
+                    "color_intrinsics": self._intr_to_dict(cprof.get_intrinsics()),
+                    "depth_aligned_to_color": False,
+                }
+            except Exception:
+                return None
         try:
             cprof = profile.get_stream(rs.stream.color).as_video_stream_profile()
             dprof = profile.get_stream(rs.stream.depth).as_video_stream_profile()
@@ -203,7 +223,8 @@ class RealSenseD4xx:
         with self._lock:
             if self._color is None:
                 return None, None, None
-            return self._color.copy(), self._depth.copy(), self._ts
+            depth = self._depth.copy() if self._depth is not None else None
+            return self._color.copy(), depth, self._ts
 
     def disconnect(self):
         self._running = False

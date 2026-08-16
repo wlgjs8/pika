@@ -10,7 +10,7 @@
 PY     ?= .venv/bin/python
 SCRIPT ?= scripts/collect.py
 
-.PHONY: run view identify pose-test
+.PHONY: run identify pose-test
 
 # 좌/우 팔 식별 마법사 → config/arms.json 저장 (실행 전 run/view 종료할 것)
 identify:
@@ -24,11 +24,6 @@ ARGS ?=
 # 헤드리스 수집 + 진단 로깅
 run:
 	$(PY) $(SCRIPT) $(ARGS)
-
-# 수집 + rerun 라이브 뷰어(브라우저, 양팔이면 양쪽 표시). 네이티브 창은 VIEW=spawn
-VIEW ?= web
-view:
-	$(PY) $(SCRIPT) --view $(VIEW) $(ARGS)
 
 # 포즈 백엔드 스모크 테스트 (libsurvive, SteamVR 불필요)
 pose-test:

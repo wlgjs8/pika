@@ -54,6 +54,10 @@ def _write_payload_calib(grp, calib):
         for k in ("width", "height", "fx", "fy", "ppx", "ppy", "model"):
             sub.attrs[k] = intr[k]
         sub.create_dataset("coeffs", data=np.asarray(intr["coeffs"], np.float64))
+    # depth 를 끈 수집분은 depth 관련 항목이 없다 → intrinsics 만 쓰고 빠진다.
+    if "depth_to_color_rotation" not in calib:
+        cc.attrs["depth_aligned_to_color"] = bool(calib.get("depth_aligned_to_color", False))
+        return
     R = np.asarray(calib["depth_to_color_rotation"], np.float64).reshape((3, 3), order="F")
     cc.create_dataset("depth_to_color_rotation", data=R)
     cc.create_dataset("depth_to_color_translation",
