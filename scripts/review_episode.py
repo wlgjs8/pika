@@ -4,11 +4,12 @@
 HDF5 에서 직접 디코드해 띄운다 — 예전 HTML 리뷰어처럼 JPEG 에셋을 디스크로 추출하거나
 HTTP 서버를 띄우지 않는다(13 에피소드 빌드에 2분 이상 걸리던 단계가 사라진다).
 
-기본 실행: 최신 data_* 세션의 모든 에피소드를 순서대로 검수
+기본 실행: **최신 세션의 첫 에피소드**에서 시작하고, 전 세션이 시간순으로 이어져 있어
+이전 에피소드(a)로 계속 넘어가면 세션 경계를 넘어 직전 세션의 마지막 에피소드로 간다.
   .venv/bin/python scripts/review_episode.py
 
   --episode <path.hdf5>   에피소드 하나만
-  --session <data_* dir>  특정 세션
+  --session <data_* dir>  그 세션으로 한정(세션 경계를 넘지 않음)
   --arms left,right       표시할 팔 (기본: 파일에 있는 전부)
   --streams color,fisheye,depth
 
@@ -51,21 +52,38 @@ def _log(message):
     print(f"[review] {message}", flush=True)
 
 
-def _latest_session_dir():
+def _episode_paths_for_session(session_dir):
+    paths = sorted(glob.glob(os.path.join(session_dir, "episode_*.hdf5")))
+    if not paths:
+        raise FileNotFoundError(f"No episode_*.hdf5 files under {session_dir}")
+    return paths
+
+
+def _session_dirs():
+    """에피소드가 있는 data_* 세션 전부, 오래된 것부터(이름이 data_YYYYMMDD_HHMMSS)."""
     dirs = [
         path for path in glob.glob(os.path.join(DATA_ROOT, "data_*"))
         if os.path.isdir(path) and glob.glob(os.path.join(path, "episode_*.hdf5"))
     ]
     if not dirs:
         raise FileNotFoundError(f"No data_* folders with episode_*.hdf5 under {DATA_ROOT}")
-    return sorted(dirs)[-1]
+    return sorted(dirs)
 
 
-def _episode_paths_for_session(session_dir):
-    paths = sorted(glob.glob(os.path.join(session_dir, "episode_*.hdf5")))
-    if not paths:
-        raise FileNotFoundError(f"No episode_*.hdf5 files under {session_dir}")
-    return paths
+def _all_episode_paths():
+    """(전체 에피소드 경로, 최신 세션의 첫 에피소드 인덱스).
+
+    전 세션을 시간순 한 줄로 이어 붙이되 **최신 세션의 첫 에피소드에서 시작**한다.
+    그래서 이전 에피소드(a)로 계속 넘어가면 세션 경계를 넘어 직전 세션의 마지막
+    에피소드로 이어진다.
+    """
+    paths, start = [], 0
+    sessions = _session_dirs()
+    for i, session in enumerate(sessions):
+        if i == len(sessions) - 1:
+            start = len(paths)          # 최신 세션이 시작점
+        paths.extend(_episode_paths_for_session(session))
+    return paths, start
 
 
 def _attr_text(value):
@@ -262,7 +280,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--episode", help="에피소드 HDF5 하나만 검수")
-    ap.add_argument("--session", help="이 data_* 폴더의 에피소드 전부 (기본: 최신 세션)")
+    ap.add_argument("--session",
+                    help="이 data_* 폴더로 한정. 기본은 전 세션을 시간순으로 잇고 "
+                         "최신 세션의 첫 에피소드에서 시작(a 로 이전 세션까지 거슬러 감)")
     ap.add_argument("--arms", help="표시할 팔(쉼표). 기본: 파일에 있는 전부")
     ap.add_argument("--streams", help="표시할 스트림(쉼표): color,fisheye,depth. 기본: 전부")
     ap.add_argument("--cell-width", type=int, default=420, help="셀 하나의 가로 픽셀")
@@ -275,16 +295,23 @@ def main():
     a = ap.parse_args()
 
     if a.episode:
-        paths = [a.episode]
+        paths, start = [a.episode], 0
+    elif a.session:
+        paths, start = _episode_paths_for_session(a.session), 0
     else:
-        session = a.session or _latest_session_dir()
-        paths = _episode_paths_for_session(session)
+        # 전 세션을 시간순으로 잇고 최신 세션의 첫 에피소드에서 시작한다.
+        paths, start = _all_episode_paths()
     want_arms = [x.strip() for x in a.arms.split(",")] if a.arms else None
     want_streams = {x.strip() for x in a.streams.split(",")} if a.streams else None
 
-    _log(f"{len(paths)} episode(s): {os.path.dirname(paths[0]) or '.'}")
+    sessions = sorted({os.path.basename(os.path.dirname(p)) for p in paths})
+    _log(f"{len(paths)} episode(s) across {len(sessions)} session(s): "
+         f"{sessions[0]}{' … ' + sessions[-1] if len(sessions) > 1 else ''}")
+    if start:
+        _log(f"최신 세션의 첫 에피소드({start + 1}/{len(paths)})에서 시작 — "
+             f"a 를 계속 누르면 이전 세션으로 거슬러 갑니다")
 
-    ep_idx, ep, idx = 0, None, 0
+    ep_idx, ep, idx = start, None, 0
     playing = not a.start_paused
     speed = 1.0
     show_help = True
@@ -297,7 +324,7 @@ def main():
         ep_idx = i % len(paths)
         ep = Episode(paths[ep_idx], want_arms, want_streams)
         idx = 0
-        _log(f"[{ep_idx + 1}/{len(paths)}] {ep.name}  frames={ep.n}  "
+        _log(f"[{ep_idx + 1}/{len(paths)}] {ep.session}/{ep.name}  frames={ep.n}  "
              f"{ep.duration:.2f}s  arms={[x['name'] for x in ep.arms]}")
         cv2.setTrackbarMax("frame", WINDOW, max(1, ep.n - 1))
         cv2.setTrackbarPos("frame", WINDOW, 0)
@@ -310,7 +337,7 @@ def main():
             idx = max(0, min(pos, ep.n - 1)) if ep else 0
 
     cv2.createTrackbar("frame", WINDOW, 0, 1, on_track)
-    open_episode(0)
+    open_episode(start)
 
     last = time.perf_counter()
     try:

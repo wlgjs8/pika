@@ -226,18 +226,20 @@ JSON 출력:
 
 ### 6. 에피소드 리뷰 (로컬 OpenCV 창)
 
-최신 세션의 모든 에피소드를 순서대로 검수:
-
 ```bash
 ./scripts/run_review_episode.sh
 ```
 
-특정 세션 또는 에피소드 지정:
+**최신 세션의 첫 에피소드에서 시작**하고, 전 세션이 시간순으로 한 줄로 이어져 있습니다.
+`a`(이전)를 계속 누르면 세션 경계를 넘어 직전 세션의 마지막 에피소드로 거슬러 갑니다.
+목록의 양 끝에서는 순환합니다(가장 오래된 것 ↔ 가장 최신).
+
+특정 세션 또는 에피소드로 한정:
 
 ```bash
-./scripts/run_review_episode.sh --session data/data_YYYYMMDD_HHMMSS
+./scripts/run_review_episode.sh --session data/data_YYYYMMDD_HHMMSS   # 세션 경계 안 넘음
 ./scripts/run_review_episode.sh --episode data/data_YYYYMMDD_HHMMSS/episode_000.hdf5
-./scripts/run_review_episode.sh --arms left --streams color,depth   # 일부만
+./scripts/run_review_episode.sh --arms left --streams color,depth     # 일부만
 ```
 
 팔=행, 스트림(D405 color / 어안 / depth)=열로 배치하고 하단에 프레임 번호·경과 시간·
