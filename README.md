@@ -369,9 +369,16 @@ momentary 클러치는 계속 밟고 있으므로 한 번 밟을 때마다 길�
 robotics_lab `rb_gui` 전용이라 평소엔 rb_gui 가 점유해 문제가 없지만, 발행자만 단독으로
 실행하면 아무도 점유하지 않아 그 발판이 그대로 샙니다. 두 가지 중 하나로 해결합니다.
 
-- `make run`(robotics_lab)을 함께 띄운다 → rb_gui 가 자기 발판을 점유 (권장, 평소 운용 방식)
-- 발행자를 단독 실행할 때만 `--mute-other-pedals` → 나머지 발판을 점유만 해서 누수 차단
-  (이벤트는 읽지 않음). 단, 이 상태로 나중에 rb_gui 를 띄우면 그쪽 발판이 비활성됩니다.
+`run_umi_teleop_publish.sh` 는 `--mute-other-pedals` 를 **기본으로 켭니다** — 나머지 발판을
+점유만 해서(이벤트는 읽지 않음) 누수를 막습니다. `make run` 을 먼저 띄운 경우엔 rb_gui 가
+이미 3구를 점유하고 있어 이 grab 이 실패하는데, 이미 막혀 있다는 뜻이라 무해합니다.
+
+**순서만 주의하세요.** 발행자를 먼저 띄우면 나중에 뜨는 rb_gui 가 자기 발판을 못 잡아
+InitMotion 발판이 비활성됩니다(rb_gui 가 그 이유를 로그에 명시합니다). 그 순서로 써야 하면:
+
+```bash
+MUTE_OTHER_PEDALS=0 ./scripts/run_umi_teleop_publish.sh
+```
 
 ### 발판을 밟아도 반응이 없음
 
