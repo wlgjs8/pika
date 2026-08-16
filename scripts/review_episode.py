@@ -281,7 +281,8 @@ def _stream_title(key):
     return key
 
 
-def _compose(ep, idx, cell_w, cell_h, show_help, achieved_fps=0.0):
+def _compose(ep, idx, cell_w, cell_h, show_help, achieved_fps=0.0,
+             speed=1.0, playing=False):
     """팔=행, 스트림=열 격자 + 하단 상태줄."""
     rows = []
     for arm in ep.arms:
@@ -302,8 +303,10 @@ def _compose(ep, idx, cell_w, cell_h, show_help, achieved_fps=0.0):
     lines = [
         f"{ep.session}/{ep.name}   frame {idx + 1}/{ep.n}   "
         f"t={ep.ts[idx] - ep.ts[0]:6.2f}s / {ep.duration:.2f}s   "
-        f"{ep.attrs.get('pose_frame', '?')} ({ep.attrs.get('pose_backend', 'backend?')})   "
-        f"{rec_txt}  play {achieved_fps:4.1f}fps"
+        f"{ep.attrs.get('pose_frame', '?')} ({ep.attrs.get('pose_backend', 'backend?')})",
+        # 실제 fps 는 재생 중에만 의미가 있다(정지 중 값은 UI 루프 속도일 뿐).
+        f"{'[재생]' if playing else '[정지]'} 배속 x{speed:.2f}   {rec_txt}   "
+        + (f"실제 {achieved_fps:4.1f}fps" if playing else "실제 --"),
     ]
     for arm in ep.arms:
         pose, grip = arm["pose"], arm["gripper"]
@@ -318,12 +321,21 @@ def _compose(ep, idx, cell_w, cell_h, show_help, achieved_fps=0.0):
             g = np.atleast_1d(grip[idx])
             parts.append("grip=" + ",".join(f"{v:.3f}" for v in g))
         lines.append("   ".join(parts))
+    help_line = None
     if show_help:
+        help_line = len(lines)
         lines.append("space 재생/정지  . , 프레임  d a 에피소드  + - 속도  g e 처음/끝  s 저장  h 도움말  q 종료")
 
     bar = np.zeros((18 * len(lines) + 8, grid.shape[1], 3), np.uint8)
     for i, text in enumerate(lines):
-        color = (255, 255, 255) if i == 0 else (185, 225, 185)
+        if i == 0:
+            color = (255, 255, 255)                                  # 파일/프레임
+        elif i == 1:
+            color = (110, 230, 255) if playing else (150, 190, 210)  # 재생 상태·배속(호박색/회색)
+        elif i == help_line:
+            color = (150, 150, 150)                                  # 도움말
+        else:
+            color = (185, 225, 185)                                  # 팔별 pose/gripper
         cv2.putText(bar, text, (8, 16 + i * 18), FONT, 0.44, color, 1, cv2.LINE_AA)
     return np.vstack([grid, bar])
 
@@ -398,11 +410,14 @@ def main():
         while True:
             period = 1.0 / max(1e-3, a.fps * speed)
             ep.prefetch(idx + 1 if playing else idx)   # 표시 중에 다음 프레임 디코드
-            canvas = _compose(ep, idx, a.cell_width, a.cell_height, show_help, achieved)
+            canvas = _compose(ep, idx, a.cell_width, a.cell_height, show_help,
+                              achieved, speed, playing)
             cv2.imshow(WINDOW, canvas)
 
             now = time.perf_counter()
-            achieved = 0.8 * achieved + 0.2 / max(1e-6, now - shown) if achieved else 1.0 / max(1e-6, now - shown)
+            if playing:   # 정지 중 루프 속도가 재생 fps 로 새어들지 않게 재생 중에만 갱신
+                inst = 1.0 / max(1e-6, now - shown)
+                achieved = 0.8 * achieved + 0.2 * inst if achieved else inst
             shown = now
             # **렌더에 쓴 시간을 대기에서 뺀다.** 빼지 않으면 waitKey(period) 가 렌더 시간
             # 위에 그대로 더해져 30Hz 수집분이 절반 속도로 재생된다(실측 15fps).
@@ -425,12 +440,10 @@ def main():
                 idx = 0
             elif key == ord("e"):
                 idx = ep.n - 1
-            elif key in (ord("+"), ord("=")):
+            elif key in (ord("+"), ord("=")):     # 배속은 상태줄에 표시되므로 로그 불필요
                 speed = min(speed * 1.5, 16.0)
-                _log(f"speed x{speed:.2f}")
             elif key == ord("-"):
                 speed = max(speed / 1.5, 0.06)
-                _log(f"speed x{speed:.2f}")
             elif key == ord("h"):
                 show_help = not show_help
             elif key == ord("s"):
