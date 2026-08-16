@@ -4,6 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 # shellcheck source=scripts/_venv.sh
 source scripts/_venv.sh
+# shellcheck source=scripts/_pedal.sh
+source scripts/_pedal.sh
 
 # 90fps RGB-only 수집 (어안·depth 비활성, 뷰어 없음).
 #
@@ -43,9 +45,11 @@ ARGS=()
 [[ "${PIKA_DEPTH:-0}"   == "1" ]] || ARGS+=(--no-depth)
 
 echo "[collect] ${HZ}Hz 기록 / RealSense ${RS_FPS}fps RGB-only / json=$RS_JSON"
+echo "[collect] 발판(녹화 토글): $PEDAL_DEVICE"
 
 exec "${PY_CMD[@]}" scripts/collect.py \
   --hz "$HZ" \
+  --pedal-device "$PEDAL_DEVICE" \
   --rs-fps "$RS_FPS" \
   --rs-json "$RS_JSON" \
   --require-pose \

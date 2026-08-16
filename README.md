@@ -14,7 +14,7 @@ AgileX PIKA Sense 기반 데이터 수집을 위한 Python 도구입니다. Vive
 - RealSense D4xx 컬러/뎁스 프레임 수집 (`--no-depth` 로 color 만, `--rs-fps 90` 지원)
 - RealSense color/depth intrinsics·depth↔color extrinsic·stereo baseline을 에피소드에 저장
 - 좌/우 팔 하드웨어 매핑을 `config/arms.json`에 저장
-- `b` 키 또는 Linux FootSwitch 입력으로 에피소드 녹화 시작/정지
+- `b` 키 또는 1구 FootSwitch(by-path 고정)로 에피소드 녹화 시작/정지
 - 수집 데이터 분석, HDF5 구조 확인, 로컬 OpenCV 창 기반 에피소드 리뷰
 
 ## 디렉터리 구조
@@ -165,7 +165,7 @@ make run
 녹화 제어:
 
 - `b`: 에피소드 녹화 시작/정지
-- Linux FootSwitch: 연결되어 있고 권한이 있으면 녹화 시작/정지
+- FootSwitch(1구): `run_collect_fast.sh` 가 by-path 로 고정. 직접 실행 시 `--pedal-device` 지정
 - `Ctrl-C`: 종료, 녹화 중이면 현재 에피소드 저장
 
 수집 결과는 기본적으로 다음 위치에 저장됩니다.
@@ -364,6 +364,23 @@ RealSense advanced-mode JSON 은 **robotics_lab 것을 경로로 직접 참조**
 | `PIKA_HZ` / `PIKA_RS_FPS` | 90 / 90 | 기록 주파수 / 스트림 fps |
 | `PIKA_FISHEYE` / `PIKA_DEPTH` | 0 / 0 | `1` 로 두면 어안/depth 를 다시 켬 |
 | `PIKA_ENCODE_WORKERS` | 4 | PNG 인코딩 worker 수 |
+| `PEDAL_DEVICE` | 1구 발판 by-path (`scripts/_pedal.sh`) | 녹화 토글 발판 |
+
+### 발판은 `scripts/_pedal.sh` 한 곳에서 정한다
+
+이 저장소가 쓰는 발판은 **1구**입니다. 수집(녹화 토글)과 teleop(클러치)이 같은 발판을
+공유하며, 둘을 동시에 돌리지 않으므로 충돌하지 않습니다. 3구 발판은 robotics_lab
+`rb_gui`(InitMotion) 전용입니다.
+
+`run_collect_fast.sh` 와 `run_umi_teleop_publish.sh` 가 모두 이 프렐류드를 source 하므로
+발판을 다른 USB 포트로 옮겼을 때 **한 곳만 고치면** 됩니다(경로 확인:
+`.venv/bin/python scripts/pedal_test.py`).
+
+고정하지 않으면 `collect.py` 는 발판이 여러 개일 때 자동 선택을 거부하고 evdev 리더를
+끕니다. 그래도 녹화는 "되는 것처럼" 보이는데, 발판이 보내는 `b` 키가 **stdin 으로 새어
+키보드 토글을 대신 때리기** 때문입니다(로그에 `by=keyboard:b` 로 남습니다). 이 경로는
+터미널 포커스가 있어야만 동작하고 화면에 `b` 가 찍힙니다. 고정하면 evdev 로 들어가고
+장치를 배타 점유하므로 키 누수도 사라집니다.
 
 수집 래퍼는 하드웨어를 **`config/arms.json` 에서만** 읽습니다. 예전에는 `--config ''` 로
 arms.json 을 무시하고 `--coms /dev/ttyUSB0,/dev/ttyUSB1` 을 강제했는데, 그 두 포트는
