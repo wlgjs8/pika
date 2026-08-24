@@ -396,6 +396,10 @@ TARGET_HOST=172.28.61.3 ./scripts/run_umi_teleop_publish.sh   # 별도 로봇 PC
 ```
 
 포즈를 UDP `50380`(좌)/`50381`(우), 그리퍼 브리지 `50382`로 발행합니다.
+표준 래퍼는 양팔 전용으로 `--require-all-trackers`를 적용합니다. `config/arms.json`에
+설정된 트래커가 하나라도 없으면 단팔 모드로 내려가지 않고 Sense 연결과 UDP 송신 전에
+종료합니다. 의도적인 단팔 진단은 `umi_teleop_publish.py`를 이 옵션 없이 직접 실행하세요.
+
 클러치 발판은 `PEDAL_DEVICE`로 **by-path 고정**되어 있습니다 — 이 리그에는 발판이 2개이고
 (1구=teleop 클러치, 3구=robotics_lab rb_gui InitMotion) 소프트웨어로는 구별할 수 없습니다.
 발판을 다른 포트로 옮겼다면 `scripts/pedal_test.py`로 경로를 다시 확인하세요.
@@ -424,6 +428,24 @@ libsurvive는 프로세스마다 콜드 스타트라 라이트하우스 획득�
 획득 시각이 다릅니다. `PoseSurvive.connect()`가 설정된 트래커가 전부 붙을 때까지 기다리지만
 (최대 10초), 계속 누락되면 그 트래커가 가려졌거나 베이스스테이션 시야 밖입니다.
 `make pose-test`로 어느 쪽이 안 잡히는지 확인하세요.
+
+먼저 OS가 두 트래커를 USB 장치로 열거했는지 확인합니다.
+
+```bash
+lsusb -d 28de:2300 -v 2>/dev/null | grep -E 'Bus|iSerial'
+journalctl -k -b --no-pager | grep -E 'error -71|unable to enumerate|Valve|LHR'
+```
+
+`28de:2300 Valve LHR`가 하나만 보이거나 `device descriptor read ... error -71`이 있으면
+libsurvive/라이트하우스 문제가 아니라 USB 링크 문제입니다. 해당 팔 허브의 호스트 케이블과
+보조 전원을 완전히 분리했다가 같은 포트에 다시 연결하고, 계속 실패하면 케이블을 교체하세요.
+SuperSpeed RealSense는 보이는데 같은 허브의 Tracker와 Sense가 함께 사라졌다면 케이블의
+USB 2.0 접점 또는 허브 초기화를 우선 의심합니다. 다른 PC 포트로 옮겼다면 바뀐 Sense
+`/dev/serial/by-path`를 `config/arms.json`에 반영해야 합니다.
+
+USB 열거 실패에는 재캘리브레이션이 도움이 되지 않습니다. 이 상태에서
+`config/libsurvive_config.json`을 삭제하지 마세요. USB 장치 두 개가 보인 뒤 `make pose-test`의
+`live=2`, 양쪽 `valid=True`, `누락=없음`을 확인하고 teleop을 다시 시작합니다.
 
 ### 포즈 위치가 수 미터~수십 미터로 나옴
 

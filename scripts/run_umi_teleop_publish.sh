@@ -34,10 +34,14 @@ fi
 # --pose-frame 은 기본 tip. robotics_lab stack_real.yaml 의 umi_dual_cartesian 이
 # gripper_offset: [0,0,0] + tip→TCP r_align 로 짝지어져 있으므로 tip 을 유지해야 한다
 # (raw 로 보내려면 수신측 legacy fallback 값으로 함께 되돌려야 함).
+# 이 표준 래퍼는 양팔 전용이다. config 의 트래커가 하나라도 없으면 SINGLE 로 조용히
+# 내려가지 않고 Sense 연결/UDP 송신 전에 실패시킨다. 단팔 진단은 Python 스크립트를
+# --require-all-trackers 없이 직접 실행한다.
 exec "${PY_CMD[@]}" scripts/umi_teleop_publish.py \
   --pedal \
   --pedal-device "$PEDAL_DEVICE" \
   "${MUTE_FLAG[@]}" \
+  --require-all-trackers \
   --swap-lr \
   --target-host "$TARGET_HOST" \
   --gripper-port 50382 \

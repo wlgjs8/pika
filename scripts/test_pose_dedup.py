@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """포즈 중복(dedup) 로직 검증 — 하드웨어/SteamVR 불필요.
 
-실제 PoseSteamVR._sample_seq 와 build_packet 을 합성 스트림으로 구동한다:
+실제 두 포즈 백엔드가 공유하는 SampleSeqTracker와 build_packet을 합성 스트림으로 구동한다:
   - 폴링 250Hz, 트래커 native 갱신 120Hz, 발행 200Hz
   - 추적손실 동결(eTrackingResult 201/300) = 같은 값 N연속
 
@@ -11,25 +11,10 @@
 import bisect
 import os
 import sys
-import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# openvr 가 없으면(서버/CI) 최소 스텁 주입 — _sample_seq/build_packet 은 런타임에
-# openvr 를 호출하지 않으므로 SteamVR 없이도 검증 가능.
-try:
-    import openvr  # noqa: F401
-except Exception:
-    stub = types.ModuleType("openvr")
-    stub.TrackingUniverseStanding = 1
-    stub.TrackedDeviceClass_GenericTracker = 3
-    stub.k_unMaxTrackedDeviceCount = 64
-    stub.VRApplication_Background = 2
-    stub.init = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stub"))
-    stub.shutdown = lambda: None
-    sys.modules["openvr"] = stub
-
-from pika_win.pose_steamvr import PoseSteamVR  # noqa: E402
+from pika_win.pose_math import SampleSeqTracker  # noqa: E402
 from scripts.umi_teleop_publish import build_packet  # noqa: E402
 
 POLL_HZ, NATIVE_HZ, PUB_HZ, DUR = 250.0, 120.0, 200.0, 4.0
@@ -37,15 +22,14 @@ QUAT = (0.0, 0.0, 0.0, 1.0)
 
 
 def test_sample_seq_oversampling():
-    src = PoseSteamVR.__new__(PoseSteamVR)  # __init__ 우회(openvr.init 불필요)
-    src._seq = {}
+    seq_tracker = SampleSeqTracker()
     poll_t, poll_seq = [], []
     fresh_polls = 0
     for k in range(int(POLL_HZ * DUR)):
         tp = k / POLL_HZ
         vidx = int(tp * NATIVE_HZ)            # 1/120s 마다 +1 되는 '진짜 샘플'
         pos = (vidx * 1e-3, 0.0, 0.0)         # 같은 bin 폴은 동일 좌표 → 중복
-        seq, _sts, fresh = src._sample_seq("LHR-TEST", pos, QUAT, tp)
+        seq, _sts, fresh = seq_tracker.update("LHR-TEST", pos, QUAT, tp)
         poll_t.append(tp)
         poll_seq.append(seq)
         fresh_polls += int(fresh)
@@ -81,9 +65,9 @@ def test_build_packet_wire():
 
 
 def test_tracking_loss_freeze():
-    src = PoseSteamVR.__new__(PoseSteamVR)
-    src._seq = {}
-    res = [src._sample_seq("X", (1.23, 4.56, 7.89), QUAT, 10.0 + i * 0.005) for i in range(50)]
+    seq_tracker = SampleSeqTracker()
+    res = [seq_tracker.update("X", (1.23, 4.56, 7.89), QUAT, 10.0 + i * 0.005)
+           for i in range(50)]
     freshes = [r[2] for r in res]
     assert freshes[0] is True and all(f is False for f in freshes[1:])  # 첫 폴만 fresh
     assert len(set(r[0] for r in res)) == 1                             # seq 완전 동결

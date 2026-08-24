@@ -514,7 +514,7 @@ def selftest():
     print("selftest OK (tip-transform 포함)")
 
 
-def get_arguments():
+def get_arguments(argv=None):
     ap = argparse.ArgumentParser(description="UMI 라이브 텔레오퍼레이션 포즈 퍼블리셔")
     ap.add_argument("--selftest", action="store_true",
                     help="하드웨어 없이 패킷 빌더 검증 후 종료")
@@ -544,6 +544,10 @@ def get_arguments():
     ap.add_argument("--pose-frame", choices=("tip", "tracker"), default="tip",
                     help="발행 포즈 원점: tip=PIKA 공식 그리퍼 팁 변환 적용(기본, "
                          "URDF 팁 TCP와 짝), tracker=raw 트래커 원점(구 동작)")
+    ap.add_argument("--require-all-trackers", action="store_true",
+                    help="config에 설정된 tracker SN이 모두 보이지 않으면 Sense 연결과 "
+                         "UDP 송신 전에 종료. 표준 run_umi_teleop_publish.sh는 양팔 안전을 "
+                         "위해 이 옵션을 기본 적용")
     ap.add_argument("--pedal", action="store_true",
                     help="USB 발판(FootSwitch)을 클러치로 사용(키보드 대신, stdin 무의존)")
     ap.add_argument("--pedal-device", default="auto",
@@ -575,8 +579,21 @@ def get_arguments():
     ap.add_argument("--packet-log-dir", default=os.path.join(REPO_ROOT, "logs"),
                     help="패킷 로그 디렉터리(기본 pika/logs)")
     ap.add_argument("--verbose", action="store_true")
-    args, _ = ap.parse_known_args()
+    args, _ = ap.parse_known_args(argv)
     return args
+
+
+def _create_recorder(a, arms, recorder_cls=None):
+    """CLI 안전 옵션을 EpisodeRecorder에 전달한다(하드웨어 없이 테스트 가능)."""
+    if recorder_cls is None:
+        from pika_win.recorder import EpisodeRecorder
+        recorder_cls = EpisodeRecorder
+    return recorder_cls(out_dir=os.path.join(REPO_ROOT, "data", "_umi_teleop_tmp"),
+                        arms=arms, use_realsense=False, use_fisheye=False,
+                        use_sense=not a.no_sense, use_pose=True, require_pose=True,
+                        require_all_trackers=a.require_all_trackers,
+                        pose_tip_frame=(a.pose_frame == "tip"),
+                        pose_backend=a.pose_backend)
 
 
 def main():
@@ -587,14 +604,8 @@ def main():
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(message)s")
     quiet_pika_sdk_info(show_parse_errors=a.show_sdk_parse_errors)
-    from pika_win.recorder import EpisodeRecorder  # 포즈 백엔드 의존 — main 안에서 지연 임포트
-
     arms = load_arms(a.config)
-    rec = EpisodeRecorder(out_dir=os.path.join(REPO_ROOT, "data", "_umi_teleop_tmp"),
-                          arms=arms, use_realsense=False, use_fisheye=False, use_sense=not a.no_sense,
-                          use_pose=True, require_pose=True,
-                          pose_tip_frame=(a.pose_frame == "tip"),
-                          pose_backend=a.pose_backend)
+    rec = _create_recorder(a, arms)
     rec.start()
     names = rec.arm_names()
     log.info("[umi] 활성 팔: %s  pose_frame=%s", names,

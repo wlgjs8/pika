@@ -40,7 +40,10 @@ def main():
 
     pose = PoseSurvive(apply_gripper_offset=a.tip,
                        config_path=a.survive_config,
-                       force_calibrate=a.recalibrate).connect()
+                       force_calibrate=a.recalibrate,
+                       # arms.json에 설정된 트래커가 모두 붙을 때까지 기다려야
+                       # 한쪽이 늦게 올라오는 양팔 상태도 정확히 진단할 수 있다.
+                       warmup_expect=list(want)).connect()
     if a.recalibrate:
         print("[cal] 재캘리브레이션 — 트래커를 작업 공간 전체에 걸쳐 천천히 움직이세요 "
               "(위치+자세 모두 바꿔가며, 베이스스테이션 시야 확보)")
@@ -57,7 +60,11 @@ def main():
             last = now
             devs = pose.get_devices()
             snap = pose.get_pose()
-            if not isinstance(snap, dict):
+            # get_pose()는 살아있는 트래커가 하나면 pose dict 자체를, 둘 이상이면
+            # serial -> pose dict를 반환한다. 단일 반환도 동일한 map 형태로 정규화한다.
+            if isinstance(snap, dict) and "position" in snap:
+                snap = {snap["device_name"]: snap}
+            elif not isinstance(snap, dict):
                 snap = {snap["device_name"]: snap} if snap else {}
             # 두 트래커 간 거리는 solve 품질의 가장 빠른 sanity check —
             # 실제 물리 거리와 맞고 움직여도 안정적이어야 한다.
