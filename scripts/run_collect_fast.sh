@@ -43,6 +43,8 @@ ARGS=()
 # 어안/depth 를 다시 켜려면: PIKA_FISHEYE=1 / PIKA_DEPTH=1
 [[ "${PIKA_FISHEYE:-0}" == "1" ]] || ARGS+=(--no-fisheye)
 [[ "${PIKA_DEPTH:-0}"   == "1" ]] || ARGS+=(--no-depth)
+# 실시간 좌|우 RGB 프리뷰 창(15Hz 렌더, 창에서 'b'=REC 토글). 끄려면 PIKA_PREVIEW=0
+[[ "${PIKA_PREVIEW:-1}" == "1" ]] && ARGS+=(--preview)
 
 echo "[collect] ${HZ}Hz 기록 / RealSense ${RS_FPS}fps RGB-only / json=$RS_JSON"
 echo "[collect] 발판(녹화 토글): $PEDAL_DEVICE"

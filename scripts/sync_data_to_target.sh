@@ -57,10 +57,10 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-TARGET_IP="${ARG_TARGET_IP:-${ENV_TARGET_IP:-${TARGET_IP:-192.168.8.50}}}"
+TARGET_IP="${ARG_TARGET_IP:-${ENV_TARGET_IP:-${TARGET_IP:-192.168.8.11}}}"
 TARGET_USER="${ENV_TARGET_USER:-${TARGET_USER:-plaif}}"
 SOURCE_DIR="${ENV_SOURCE_DIR:-${SOURCE_DIR:-./data/}}"
-TARGET_DIR="${ENV_TARGET_DIR:-${TARGET_DIR:-/data/pika/bolt/data/}}"
+TARGET_DIR="${ENV_TARGET_DIR:-${TARGET_DIR:-/data/pika/bolt_v2/data/}}"
 PASSWD="${ENV_PASSWD:-${PASSWD:-}}"
 DRY_RUN="${ENV_DRY_RUN:-${DRY_RUN:-0}}"
 

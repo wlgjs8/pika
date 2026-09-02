@@ -32,6 +32,23 @@ def _write_payload_obs(grp, data, vlen):
     grp.create_dataset("pose", data=pose)
     grp.create_dataset("gripper", data=grip)
     grp.create_dataset("command", data=cmd)
+    # 스트림별 호스트 타임스탬프(time.time()). 카메라를 마스터로 pose/gripper 를 보간하는
+    # 후처리 타임싱크의 재료 — 없던 레거시 payload 도 그대로 통과한다(하위호환).
+    for ts_key in ("pose_sample_ts", "rs_ts", "gripper_ts"):
+        if ts_key in data:
+            grp.create_dataset(ts_key, data=np.asarray(data[ts_key], np.float64))
+    # 카메라=마스터 보간을 저장 시점에 자동 수행 (pose_synced/gripper_synced).
+    # 원본은 그대로 두는 파생 데이터라 실패해도 에피소드는 유효 -> fail-open.
+    # 재실행/감사는 scripts/resync_episode.py.
+    if "rs_ts" in data:
+        try:
+            from .timesync import sync_arm
+            synced = sync_arm(pose, data.get("pose_sample_ts"), grip,
+                              data.get("gripper_ts"), data["rs_ts"])
+            for k, v in synced.items():
+                grp.create_dataset(k, data=v)
+        except Exception as e:  # noqa: BLE001
+            print(f"[writer] timesync 스킵({e}) -- 원본 스트림은 저장됨", flush=True)
     img = grp.create_group("images")
     for key, buffers in data["images"].items():
         ds = img.create_dataset(key, (len(buffers),), dtype=vlen)

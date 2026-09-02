@@ -403,11 +403,13 @@ class EpisodeRecorder:
             except Exception:
                 pass
         arm["gripper"] = [ga, gd]
+        arm["gripper_ts"] = time.time() if io.sense is not None else None
         arm["command"] = cs if isinstance(cs, (int, float)) else -1
         # camera (RealSense color+depth)
         if io.rs is not None:
-            c, d, _ = io.rs.get_frames()
+            c, d, rs_ts = io.rs.get_frames()
             arm["realsense_color"] = c
+            arm["rs_ts"] = rs_ts
             if d is not None:
                 arm["realsense_depth"] = d
         # 어안 카메라(raw fisheye → 저장 시 PNG)
@@ -438,6 +440,10 @@ class EpisodeRecorder:
                 "pose": arm["pose"],
                 "gripper": arm["gripper"],
                 "command": arm["command"],
+                # 후처리 타임싱크(카메라=마스터 보간)의 재료. 수집 때만 얻을 수 있다.
+                "pose_sample_ts": arm.get("pose_sample_ts"),
+                "rs_ts": arm.get("rs_ts"),
+                "gripper_ts": arm.get("gripper_ts"),
                 "enc": enc,
             })
         return {"ts": fr["ts"], "arms": arms_c}
@@ -467,10 +473,16 @@ class EpisodeRecorder:
                 key: [f["arms"][ai]["enc"][key].result() for f in frames_c]
                 for key in keys
             }
+            def _ts_list(key):
+                return [(f["arms"][ai].get(key) if f["arms"][ai].get(key) is not None else float("nan"))
+                        for f in frames_c]
             arms_data.append({
                 "pose": [f["arms"][ai]["pose"] for f in frames_c],
                 "gripper": [f["arms"][ai]["gripper"] for f in frames_c],
                 "command": [f["arms"][ai]["command"] for f in frames_c],
+                "pose_sample_ts": _ts_list("pose_sample_ts"),
+                "rs_ts": _ts_list("rs_ts"),
+                "gripper_ts": _ts_list("gripper_ts"),
                 "images": images,
             })
         pose_frame, pose_backend = self.pose_frame_attrs()

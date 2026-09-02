@@ -548,6 +548,83 @@ class PedalToggle:
         return pressed
 
 
+class LivePreview:
+    """수집 중 좌|우 RGB 실시간 창 (review_rgb_episode 의 표시 규약을 따름).
+
+    수집 루프는 90 Hz 가 제1 계약이므로 프리뷰는 (1) every 틱마다 한 번만 렌더하고
+    (2) 실패하면 수집을 죽이는 대신 스스로 꺼진다 (프리셋의 fail-closed 와 반대로,
+    뷰어는 본질 기능이 아니라서 fail-open 이 맞다). 창에서 'b' 를 눌러도 REC 토글로
+    전달된다 -- 창에 포커스가 가면 터미널 'b' 가 안 먹는 문제의 보완.
+    """
+
+    def __init__(self, names, bolt_colors, every=6, scale=1.0):
+        # 프리뷰를 안 쓰는 헤드리스 수집이 cv2 유무에 묶이지 않도록 지연 임포트.
+        global cv2, np
+        import cv2  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
+        self.names = list(names)
+        self.colors = str(bolt_colors)
+        self.every = max(1, int(every))
+        self.scale = float(scale)
+        self._n = 0
+        self._dead = False
+        self._win = "collect preview  ('b'=REC toggle, q=close preview)"
+        self._font = cv2.FONT_HERSHEY_SIMPLEX
+        self._prev_ts = None
+        self._hz = 0.0
+
+    def update(self, fr, recording, ep):
+        ts = fr.get("ts")
+        if ts is not None and self._prev_ts is not None:
+            inst = 1.0 / max(ts - self._prev_ts, 1e-6)
+            self._hz = inst if self._hz == 0.0 else 0.98 * self._hz + 0.02 * inst
+        self._prev_ts = ts
+        eff_hz = self._hz
+        """매 틱 호출. 렌더한 틱에서만 waitKey 키코드(int)를, 나머지는 -1 을 돌려준다."""
+        if self._dead:
+            return -1
+        self._n += 1
+        if self._n % self.every:
+            return -1
+        try:
+            tiles = []
+            order = sorted(range(len(self.names)), key=lambda i: 0 if self.names[i] == "left" else 1)
+            for i in order:
+                img = fr["arms"][i].get("realsense_color")
+                if img is None:
+                    img = np.zeros((480, 640, 3), np.uint8)
+                if self.scale != 1.0:
+                    img = cv2.resize(img, None, fx=self.scale, fy=self.scale,
+                                     interpolation=cv2.INTER_AREA)
+                else:
+                    img = img.copy()
+                cv2.putText(img, self.names[i].upper(), (8, 20), self._font, 0.55,
+                            (185, 225, 185), 1, cv2.LINE_AA)
+                tiles.append(img)
+            canvas = cv2.hconcat(tiles) if len(tiles) > 1 else tiles[0]
+            bar = np.zeros((32, canvas.shape[1], 3), np.uint8)
+            state = f"REC ep{ep:03d}" if recording else "IDLE"
+            # 상태를 창 전체 굵은 테두리로도 표시: 녹화=초록, 대기=빨강.
+            # 화면 반대편에서 페달만 밟고도 REC 여부를 즉시 확인하기 위한 것.
+            border = (0, 200, 0) if recording else (0, 0, 230)
+            cv2.putText(bar, f"{state}   {eff_hz:5.1f}Hz   {self.colors}", (12, 23),
+                        self._font, 0.6, border, 2, cv2.LINE_AA)
+            frame_out = cv2.vconcat([bar, canvas])
+            frame_out = cv2.copyMakeBorder(frame_out, 12, 12, 12, 12,
+                                           cv2.BORDER_CONSTANT, value=border)
+            cv2.imshow(self._win, frame_out)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                cv2.destroyWindow(self._win)
+                self._dead = True
+                return -1
+            return int(key)
+        except Exception as e:  # noqa: BLE001 -- 뷰어 실패로 수집을 멈추지 않는다
+            log.warning("[preview] 비활성화(%s) -- 수집은 계속됩니다", e)
+            self._dead = True
+            return -1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hz", type=float, default=30.0)
@@ -564,13 +641,17 @@ def main():
     ap.add_argument("--min-record-sec", type=float, default=1.0,
                     help="REC 시작 직후 이 시간 안의 정지 토글은 무시")
     ap.add_argument("--start-index", type=int, default=0)
-    # ap.add_argument("--arm-bolt-colors", default="right=black,left=gray",
-    ap.add_argument("--arm-bolt-colors", default="right=gray,left=black",
+    # 기본값 normal. 2026-09-02 파일럿 6 에피소드가 swap 기본값을 라벨로 물려받았지만
+    # 파지 프레임 검증 결과 실제 시연은 normal(오른손=검정)이라 attrs 를 사후 정정했다.
+    # swap 세션을 찍을 때만 명시적으로 --arm-bolt-colors right=gray,left=black 을 준다.
+    ap.add_argument("--arm-bolt-colors", default="right=black,left=gray",
                     help="이번 세션에서 각 팔이 집는 볼트 색 (예: 'right=black,left=gray'=normal, "
                          "'right=gray,left=black'=swap). 매 에피소드 HDF5 attr `arm_bolt_colors`로 기록 → "
                          "변환기가 색-grounded 프롬프트 배정. 박스는 색-매칭(coordinated)이라 별도 표기 불필요. "
                          "미지정/레거시 데이터는 normal로 간주.")
     ap.add_argument("--no-realsense", default=False, action="store_true")
+    ap.add_argument("--preview", default=False, action="store_true",
+                    help="좌|우 RGB 실시간 OpenCV 창 표시(15Hz 렌더). 창에서 'b'=REC 토글, 'q'=창만 닫기")
     ap.add_argument("--no-fisheye", default=False, action="store_true",
                     help="그리퍼 어안 카메라 수집 비활성화")
     ap.add_argument("--no-depth", default=False, action="store_true",
@@ -732,6 +813,10 @@ def main():
     log.info("준비 완료 ✅  [%s] 모드. %s로 시작/정지. Ctrl-C 종료.",
              "양팔" if n > 1 else "한팔", toggle_desc)
     log.info("[keyboard] terminal focus 상태에서 'b'를 누르면 REC 시작/정지")
+    preview = None
+    if a.preview:
+        preview = LivePreview(names, a.arm_bolt_colors)
+        log.info("[preview] 실시간 창 활성 (15Hz 렌더, 창에서 'b'=REC 토글 / 'q'=창 닫기)")
     if pedal.enabled:
         log.info("[pedal] FootSwitch를 밟아도 REC 시작/정지")
     log.info("[timing] frame gap 기록 파일: %s", timing_gap_path)
@@ -780,6 +865,8 @@ def main():
             # ---- b 키 입력으로 REC 토글. 그리퍼 움직임은 녹화 제어에 사용하지 않는다. ----
             toggled, toggled_by = False, None
             toggle_sources = []
+            if preview is not None and preview.update(fr, recording, ep) == ord("b"):
+                toggle_sources.append("preview:b")
             if keyboard.pressed():
                 toggle_sources.append("keyboard:b")
             if pedal.pressed():
