@@ -30,6 +30,7 @@ import numpy as np
 from .pose import BACKEND_LABELS, make_pose_reader
 from .realsense_win import RealSenseD4xx
 from .fisheye import FisheyeCamera, resolve_fisheye_node
+from .sense_health import wait_for_sense_encoder
 
 log = logging.getLogger("pika.recorder")
 
@@ -75,7 +76,7 @@ class EpisodeRecorder:
                  png_compression=1, png_depth_compression=None, encode_workers=None,
                  arm_bolt_colors="right=black,left=gray",
                  # ---- 레거시 단일-팔 호환 kwargs (arms 미지정 시 사용) ----
-                 com_port="COM3", realsense_sn=None):
+                 com_port="COM3", realsense_sn=None, sense_valid_timeout=2.0):
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
         if arms is None:
@@ -104,6 +105,7 @@ class EpisodeRecorder:
         self.require_pose = bool(require_pose)
         self.require_all_trackers = bool(require_all_trackers)
         self.pose_valid_timeout = float(pose_valid_timeout)
+        self.sense_valid_timeout = max(0.0, float(sense_valid_timeout))
         # True 시 PIKA SDK 공식 트래커→그리퍼 팁 변환을 적용해 발행/기록
         # (pose_math.apply_tip_transform 참조)
         self.pose_tip_frame = bool(pose_tip_frame)
@@ -164,13 +166,7 @@ class EpisodeRecorder:
 
         # 3) 각 활성 팔의 Sense / RealSense 연결
         if self.flags["sense"]:
-            from pika.sense import Sense
-            for io in self.active:
-                s = io.spec
-                if not s.com_port:
-                    raise RuntimeError(f"[{s.name}] Sense COM 포트 미지정 — config/arms.json 또는 --coms 로 지정하세요.")
-                io.sense = Sense(port=s.com_port)
-                log.info("[%s] sense %s connect -> %s", s.name, s.com_port, io.sense.connect())
+            self._connect_senses()
         if self.flags["realsense"]:
             for io in self.active:
                 s = io.spec
@@ -255,6 +251,47 @@ class EpisodeRecorder:
             "[pose] 활성 arm tracker pose가 유효하지 않습니다. "
             f"active={[io.tracker_sn for io in self.active]} detected={detected} invalid={missing}"
         )
+
+    def _connect_senses(self, sense_cls=None):
+        """모든 활성 팔의 Sense 연결과 첫 실제 AS5047 프레임을 검증한다.
+
+        SDK의 미연결 기본 엔코더 값도 0이므로 ``get_encoder_data()`` 값만으로는
+        연결 성공을 판별할 수 없다. 원시 시리얼 리더가 파싱한 AS5047 프레임을
+        확인해야 정상적으로 닫힌 0 rad와 무응답 포트를 구별할 수 있다.
+        """
+        if sense_cls is None:
+            from pika.sense import Sense
+            sense_cls = Sense
+
+        for io in self.active:
+            spec = io.spec
+            if not spec.com_port:
+                self._raise_start_error(
+                    f"[{spec.name}] Sense COM 포트 미지정 — "
+                    "config/arms.json 또는 --coms 로 지정하세요."
+                )
+            try:
+                io.sense = sense_cls(port=spec.com_port)
+                connected = io.sense.connect()
+            except Exception as exc:
+                self._raise_start_error(
+                    f"[{spec.name}] Sense 연결 예외: port={spec.com_port} error={exc}"
+                )
+            if not connected or not bool(getattr(io.sense, "is_connected", False)):
+                self._raise_start_error(
+                    f"[{spec.name}] Sense 연결 실패: port={spec.com_port} — "
+                    "USB by-path와 장치 점유 상태를 확인하세요."
+                )
+
+            sample = wait_for_sense_encoder(io.sense, self.sense_valid_timeout)
+            if sample is None:
+                self._raise_start_error(
+                    f"[{spec.name}] Sense 시리얼은 열렸지만 {self.sense_valid_timeout:g}초 안에 "
+                    f"유효한 AS5047 텔레메트리가 없습니다: port={spec.com_port} — "
+                    "로봇 Gripper 포트 또는 잘못된 USB by-path인지 확인하세요."
+                )
+            log.info("[%s] sense %s connected (AS5047 angle=%.2fdeg rad=%.3f)",
+                     spec.name, spec.com_port, sample["angle"], sample["rad"])
 
     def _detect_trackers(self):
         """settle 동안 폴링해 안정적으로 보이는 트래커 시리얼 집합을 정렬 반환."""

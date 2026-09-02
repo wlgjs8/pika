@@ -279,6 +279,18 @@ JSON 출력:
 양팔 3스트림이면 프레임마다 PNG 6장을 디코드해야 하는데(실측 ~33ms), 표시 중에 다음
 프레임을 미리 디코드하는 워커가 있어 실시간이 유지됩니다(캐시 적중 시 합성 3.9ms).
 
+RealSense RGB 두 뷰만 수집 해상도 그대로 좌우로 보려면 RGB 전용 리뷰어를 사용합니다.
+HDF5 저장 순서와 관계없이 `left | right` 순서로 고정하며 depth와 fisheye는 디코드하지
+않습니다. 현재 640×480 수집분은 영상 영역이 1280×480으로 표시되고, 상태 정보는 영상
+아래에만 붙습니다. 조작키와 기본 에피소드 탐색 방식은 위 범용 리뷰어와 같습니다.
+
+```bash
+./scripts/run_review_rgb_episode.sh
+./scripts/run_review_rgb_episode.sh --session data/data_YYYYMMDD_HHMMSS
+./scripts/run_review_rgb_episode.sh --episode data/data_YYYYMMDD_HHMMSS/episode_000.hdf5
+./scripts/run_review_rgb_episode.sh --play             # 바로 재생
+```
+
 ### 7. HDF5 구조 확인
 
 ```bash
@@ -346,6 +358,7 @@ make run PY="conda run --no-capture-output -n pika python"   # conda 환경을 �
 ```bash
 ./scripts/run_collect_fast.sh     # 90fps RGB-only 수집 (어안·depth 비활성)
 ./scripts/run_review_episode.sh   # 에피소드 리뷰 (로컬 OpenCV 창)
+./scripts/run_review_rgb_episode.sh # RealSense RGB 좌우 원본 해상도 리뷰
 ./scripts/analyze_data.sh data --latest
 PY="conda run --no-capture-output -n pika python" ./scripts/run_collect_fast.sh
 ```
@@ -371,6 +384,9 @@ RealSense advanced-mode JSON 은 **robotics_lab 것을 경로로 직접 참조**
 이 저장소가 쓰는 발판은 **1구**입니다. 수집(녹화 토글)과 teleop(클러치)이 같은 발판을
 공유하며, 둘을 동시에 돌리지 않으므로 충돌하지 않습니다. 3구 발판은 robotics_lab
 `rb_gui`(InitMotion) 전용입니다.
+
+현재 1구 발판은 VIA 허브 아래
+`/dev/input/by-path/pci-0000:79:00.4-usb-0:1.1:1.0-event-kbd`로 고정되어 있습니다.
 
 `run_collect_fast.sh` 와 `run_umi_teleop_publish.sh` 가 모두 이 프렐류드를 source 하므로
 발판을 다른 USB 포트로 옮겼을 때 **한 곳만 고치면** 됩니다(경로 확인:

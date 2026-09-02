@@ -50,7 +50,7 @@ def main():
 
     grab_path = a.grab
     if grab_path == "teleop":
-        grab_path = "/dev/input/by-path/pci-0000:11:00.0-usb-0:4:1.0-event-kbd"
+        grab_path = "/dev/input/by-path/pci-0000:79:00.4-usb-0:1.1:1.0-event-kbd"
 
     print(f"발판 키보드 노드 {len(paths)}개:")
     fds = {}

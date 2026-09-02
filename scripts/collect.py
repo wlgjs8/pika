@@ -342,7 +342,7 @@ def build_arms(a):
                 com_port = d.get("com_port") or None
                 if os.name != "nt" and _looks_like_windows_com(com_port):
                     log.warning("[config][%s] Linux에서 Windows COM 포트(%s)가 설정됨. "
-                                "config/arms.json을 /dev/serial/by-id/...로 갱신하거나 --config ''로 CLI 값을 쓰세요.",
+                                "config/arms.json을 /dev/serial/by-path/...로 갱신하거나 --config ''로 CLI 값을 쓰세요.",
                                 name, com_port)
                 arms.append(ArmSpec(
                     name=name,

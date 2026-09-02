@@ -6,7 +6,8 @@
 한 번 저장하면 collect.py 가 실행 시 이 config 를 읽어 항상 같은 매핑을 쓴다.
 
 ⚠️ 실행 전 collect.py(make run/make view)를 반드시 종료하세요(장치 점유 충돌).
-Linux에서는 가능한 경우 /dev/serial/by-id/... 경로를 com_port에 저장한다.
+Linux에서는 동일한 CH340 네 개를 구분할 수 있는 /dev/serial/by-path/... 경로를
+com_port에 저장한다(/dev/serial/by-id는 먼저 잡힌 한 장치만 가리켜 사용 금지).
 실행: .venv/bin/python scripts/identify_arms.py
 """
 import glob
@@ -21,6 +22,7 @@ CONFIG_PATH = os.path.join(REPO_ROOT, "config", "arms.json")
 
 import numpy as np  # noqa: E402
 from pika_win.sdk_logging import quiet_pika_sdk_info  # noqa: E402
+from pika_win.sense_health import wait_for_sense_encoder  # noqa: E402
 
 
 def _ask(prompt):
@@ -119,9 +121,51 @@ def _linux_stable_serial_paths():
     if os.name == "nt":
         return {}
     out = {}
-    for path in sorted(glob.glob("/dev/serial/by-id/*")):
+    for path in sorted(glob.glob("/dev/serial/by-path/*")):
         out.setdefault(os.path.realpath(path), path)
     return out
+
+
+def connect_sense_candidates(coms, sense_cls=None, telemetry_timeout=2.0):
+    """CH340 후보 중 실제 AS5047 프레임을 내는 PIKA Sense만 연결해 반환."""
+    if sense_cls is None:
+        from pika.sense import Sense
+        sense_cls = Sense
+
+    senses = {}
+    for port in coms:
+        sense = None
+        try:
+            sense = sense_cls(port=port)
+            connected = sense.connect()
+        except Exception as exc:
+            print(f"  제외: {port} (연결 예외: {exc})")
+            try:
+                if sense is not None:
+                    sense.disconnect()
+            except Exception:
+                pass
+            continue
+        if not connected or not bool(getattr(sense, "is_connected", False)):
+            print(f"  제외: {port} (Sense 연결 실패/다른 프로세스가 점유)")
+            try:
+                sense.disconnect()
+            except Exception:
+                pass
+            continue
+
+        sample = wait_for_sense_encoder(sense, telemetry_timeout)
+        if sample is None:
+            print(f"  제외: {port} (AS5047 텔레메트리 없음 — PIKA Gripper 가능성)")
+            try:
+                sense.disconnect()
+            except Exception:
+                pass
+            continue
+        print(f"  Sense 확인: {port} "
+              f"(angle={sample['angle']:.2f}deg rad={sample['rad']:.3f})")
+        senses[port] = sense
+    return senses
 
 
 def identify_com(senses, coms, hand, duration=4.0):
@@ -184,13 +228,15 @@ def main():
             print("트래커가 2개 미만 — 양팔 식별 불가. 종료.")
             return
 
-        coms = detect_com_candidates()
-        print(f"Sense COM 후보: {coms}")
-        from pika.sense import Sense
-        for c in coms:
-            s = Sense(port=c)
-            s.connect()
-            senses[c] = s
+        candidates = detect_com_candidates()
+        print(f"CH340 COM 후보: {candidates}")
+        senses = connect_sense_candidates(candidates)
+        coms = sorted(senses)
+        print(f"실제 Sense COM: {coms}")
+        if len(coms) != 2:
+            print("AS5047 텔레메트리가 확인된 Sense가 정확히 2개가 아님 — "
+                  "좌/우를 임의 배정하지 않고 종료합니다.")
+            return
 
         import pyrealsense2 as rs
         rs_sns = [d.get_info(rs.camera_info.serial_number) for d in rs.context().query_devices()]

@@ -70,24 +70,25 @@ def com_ports():
     out = []
     for p in list_ports.comports():
         desc = (p.description or "") + " " + (p.manufacturer or "")
+        is_ch340 = (p.vid, p.pid) == (0x1A86, 0x7522)
         out.append({
             "device": p.device,
             "description": p.description,
-            "is_sense_candidate": ("CH340" in desc) or ("USB-SERIAL" in desc.upper()),
+            "is_sense_candidate": is_ch340 or ("CH340" in desc) or
+                                  ("USB-SERIAL" in desc.upper()),
         })
     return out, None
 
 
-def linux_serial_by_id():
+def linux_serial_by_path():
     if os.name == "nt":
         return []
     return [
         {
             "path": path,
             "target": os.path.realpath(path),
-            "is_sense_candidate": "ch340" in path.lower() or "usb-serial" in path.lower(),
         }
-        for path in sorted(glob.glob("/dev/serial/by-id/*"))
+        for path in sorted(glob.glob("/dev/serial/by-path/*"))
     ]
 
 
@@ -121,24 +122,28 @@ def main():
         print("  ", err)
     else:
         for p in cps:
-            mark = " <- Sense 후보" if p["is_sense_candidate"] else ""
+            mark = " <- CH340(Sense/Gripper) 후보" if p["is_sense_candidate"] else ""
             print(f"   {p['device']:6s}  {p['description']}{mark}")
 
     if os.name != "nt":
         print("\n[Linux stable serial paths]")
-        by_id = linux_serial_by_id()
-        if by_id:
-            for item in by_id:
-                mark = " <- Sense 후보" if item["is_sense_candidate"] else ""
+        by_path = linux_serial_by_path()
+        sense_targets = {
+            os.path.realpath(p["device"])
+            for p in (cps or []) if p["is_sense_candidate"]
+        }
+        if by_path:
+            for item in by_path:
+                mark = " <- CH340 후보" if item["target"] in sense_targets else ""
                 print(f"   {item['path']} -> {item['target']}{mark}")
         else:
-            print("   /dev/serial/by-id/* 없음")
+            print("   /dev/serial/by-path/* 없음")
         tty_usb = linux_tty_usb()
         print("   ttyUSB:", ", ".join(tty_usb) if tty_usb else "(없음)")
     print("=" * 60)
     print("이 값들로 config/arms.json 의 left/right 번들을 채우세요.")
     if os.name != "nt":
-        print("Linux에서는 COM3 대신 /dev/serial/by-id/... 경로를 com_port에 쓰는 것을 권장합니다.")
+        print("Linux에서는 COM3 대신 /dev/serial/by-path/... 경로를 com_port에 쓰세요.")
 
 
 if __name__ == "__main__":

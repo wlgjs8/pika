@@ -15,7 +15,7 @@
 # 발판을 다른 USB 포트로 옮기면 아래 경로가 사라진다 → PEDAL_DEVICE 로 덮어쓸 것
 # (경로 확인: .venv/bin/python scripts/pedal_test.py).
 
-PEDAL_DEVICE="${PEDAL_DEVICE:-/dev/input/by-path/pci-0000:11:00.0-usb-0:4:1.0-event-kbd}"
+PEDAL_DEVICE="${PEDAL_DEVICE:-/dev/input/by-path/pci-0000:79:00.4-usb-0:1.1:1.0-event-kbd}"
 
 if [[ ! -e "$PEDAL_DEVICE" ]]; then
   echo "[pedal] 지정된 발판 경로가 없습니다: $PEDAL_DEVICE" >&2
