@@ -1,5 +1,6 @@
 @echo off
 setlocal
+chcp 65001 >nul
 if not exist "%~dp0.env" (
   echo Missing %~dp0.env
   echo Run setup_ssh_key.cmd first.

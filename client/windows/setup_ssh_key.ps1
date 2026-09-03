@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param([string]$EnvFile = "")
 
 $ErrorActionPreference = "Stop"
@@ -39,20 +39,27 @@ try {
     if ($publicKey -notmatch '^ssh-ed25519 [A-Za-z0-9+/=]+(?: [A-Za-z0-9@._-]+)?$') {
         throw "예상하지 못한 Ed25519 공개키 형식입니다: $publicKeyPath"
     }
+    # Windows PowerShell 5.1의 native-command quoting을 거치면 공개키 안의 공백과
+    # 원격 shell 따옴표가 사라질 수 있다. 공백 없는 Base64 payload로 전달해 피한다.
+    $publicKeyBytes = [Text.Encoding]::UTF8.GetBytes($publicKey + "`n")
+    $publicKeyBase64 = [Convert]::ToBase64String($publicKeyBytes)
 
     $testArgs = @(
         "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
         "-o", "IdentitiesOnly=yes", "-i", $connection.Key,
         "-p", [string]$connection.Port, $connection.Target, "true"
     )
-    & ssh.exe @testArgs
+    # 아직 키가 미등록인 첫 실행의 Permission denied는 예상된 preflight 결과다.
+    & ssh.exe @testArgs 2>$null
     if ($LASTEXITCODE -eq 0) {
         Write-Host "SSH 키가 이미 등록되어 있습니다." -ForegroundColor Green
         exit 0
     }
 
     Write-Host "원격 PC에 공개키를 등록합니다. SSH 비밀번호를 이번 한 번 입력하세요." -ForegroundColor Cyan
-    $install = 'umask 077; mkdir -p "$HOME/.ssh"; touch "$HOME/.ssh/authorized_keys"; key=''{0}''; grep -qxF "$key" "$HOME/.ssh/authorized_keys" || printf "%s\n" "$key" >> "$HOME/.ssh/authorized_keys"; chmod 700 "$HOME/.ssh"; chmod 600 "$HOME/.ssh/authorized_keys"' -f $publicKey
+    # 따옴표가 없어도 안전한 원격 명령만 사용한다. temp 파일과 grep -f를 써서
+    # 공개키의 공백을 shell 변수로 다시 해석하지 않고, 재실행해도 중복 추가하지 않는다.
+    $install = "umask 077; mkdir -p .ssh; touch .ssh/authorized_keys; printf %s $publicKeyBase64 | base64 -d > .ssh/.pika_preview_key.tmp; grep -qxF -f .ssh/.pika_preview_key.tmp .ssh/authorized_keys || cat .ssh/.pika_preview_key.tmp >> .ssh/authorized_keys; rm -f .ssh/.pika_preview_key.tmp; chmod 700 .ssh; chmod 600 .ssh/authorized_keys"
     & ssh.exe -p ([string]$connection.Port) $connection.Target $install
     if ($LASTEXITCODE -ne 0) { throw "원격 공개키 등록 실패(exit=$LASTEXITCODE)" }
 

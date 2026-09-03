@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 
 function Read-PikaEnv {
     param([Parameter(Mandatory = $true)][string]$Path)

@@ -1,5 +1,6 @@
 @echo off
 setlocal
+chcp 65001 >nul
 if not exist "%~dp0.env" (
   copy /Y "%~dp0.env.example" "%~dp0.env" >nul
   echo Edit the connection settings, save, and close Notepad.
