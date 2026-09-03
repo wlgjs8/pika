@@ -14,10 +14,24 @@ HDF5 를 조립·기록하므로:
 """
 import multiprocessing as mp
 import os
+import signal
 import traceback
 
 import h5py
 import numpy as np
+
+
+def _configure_child_signals():
+    """터미널 Ctrl-C는 부모만 처리하고, terminate()는 계속 동작하게 한다."""
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        # fork 자식은 부모의 SIGTERM -> KeyboardInterrupt 핸들러도 상속한다.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 def _write_payload_obs(grp, data, vlen):
@@ -177,6 +191,7 @@ def _writer_loop(in_q, out_q):
     fork 로 생성되면 부모의 atexit(예: 수집 락 해제)를 상속하므로, 종료 시 그것이 실행돼
     부모의 락 파일을 지우지 않도록 os._exit 로 즉시 종료한다.
     """
+    _configure_child_signals()
     while True:
         item = in_q.get()
         if item is None:
@@ -218,12 +233,17 @@ class EpisodeWriterProcess:
         return info
 
     def close(self):
-        try:
-            self._in.put(None)
-        except Exception:
-            pass
-        if self._proc is not None:
-            self._proc.join(timeout=10.0)
-            if self._proc.is_alive():
-                self._proc.terminate()
-            self._proc = None
+        proc = self._proc
+        if proc is None:
+            return
+        if proc.is_alive():
+            try:
+                self._in.put(None)
+            except Exception:
+                pass
+        proc.join(timeout=10.0)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=1.0)
+        proc.close()
+        self._proc = None

@@ -26,9 +26,8 @@ try {
         New-Item -ItemType Directory -Path $keyDirectory -Force | Out-Null
     }
     if (-not (Test-Path -LiteralPath $connection.Key -PathType Leaf)) {
-        Write-Host "새 Ed25519 키를 만듭니다: $($connection.Key)" -ForegroundColor Cyan
-        Write-Host "완전 자동 실행을 원하면 passphrase 질문에서 Enter를 두 번 누르세요." -ForegroundColor Yellow
-        & ssh-keygen.exe -t ed25519 -f $connection.Key -C "pika-preview@$env:COMPUTERNAME"
+        Write-Host "자동 실행 전용 Ed25519 키를 만듭니다: $($connection.Key)" -ForegroundColor Cyan
+        & ssh-keygen.exe -q -t ed25519 -N '""' -f $connection.Key -C "pika-preview@$env:COMPUTERNAME"
         if ($LASTEXITCODE -ne 0) { throw "ssh-keygen 실패(exit=$LASTEXITCODE)" }
     }
     $publicKeyPath = "$($connection.Key).pub"
@@ -49,9 +48,18 @@ try {
         "-o", "IdentitiesOnly=yes", "-i", $connection.Key,
         "-p", [string]$connection.Port, $connection.Target, "true"
     )
-    # 아직 키가 미등록인 첫 실행의 Permission denied는 예상된 preflight 결과다.
-    & ssh.exe @testArgs 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    # Windows PowerShell 5.1은 native stderr도 ErrorActionPreference=Stop일 때
+    # terminating error로 올릴 수 있다. 첫 미등록 확인만 예외 승격을 잠시 끈다.
+    $savedErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "SilentlyContinue"
+        & ssh.exe @testArgs 2>$null
+        $preflightExit = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $savedErrorAction
+    }
+    if ($preflightExit -eq 0) {
         Write-Host "SSH 키가 이미 등록되어 있습니다." -ForegroundColor Green
         exit 0
     }

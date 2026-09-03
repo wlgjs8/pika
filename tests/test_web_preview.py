@@ -1,4 +1,6 @@
 import json
+import os
+import signal
 import socket
 import time
 import unittest
@@ -106,6 +108,17 @@ class WebPreviewTests(unittest.TestCase):
                 WebPreview(["right", "left"], port=port)
         finally:
             occupied.close()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal behavior")
+    def test_preview_child_ignores_terminal_interrupt(self):
+        preview = WebPreview(["right", "left"], port=0)
+        try:
+            os.kill(preview._process.pid, signal.SIGINT)
+            time.sleep(0.1)
+            self.assertTrue(preview.is_alive)
+            self.assertTrue(_health(preview)["ok"])
+        finally:
+            preview.close()
 
 
 if __name__ == "__main__":

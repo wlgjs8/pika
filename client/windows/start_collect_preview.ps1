@@ -56,7 +56,7 @@ try {
 
     $forward = "${localPort}:127.0.0.1:${remotePort}"
     $sshArgs = @(
-        "-tt", "-o", "ExitOnForwardFailure=yes",
+        "-tt", "-q", "-o", "ExitOnForwardFailure=yes",
         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
         "-o", "BatchMode=yes",
         "-o", "IdentitiesOnly=yes", "-i", $connection.Key,

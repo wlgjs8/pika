@@ -12,6 +12,7 @@ import ctypes
 import json
 import multiprocessing as mp
 import os
+import signal
 import threading
 import time
 from http import HTTPStatus
@@ -238,6 +239,16 @@ def _encoder_loop(shared, hub, names, source_shape, tile_width, jpeg_quality):
 
 def _preview_process_main(shared, names, source_shape, tile_width, jpeg_quality,
                           host, port, ready):
+    # SSH/터미널의 Ctrl-C는 수집 부모만 처리한다. 자식이 공유 Event/Lock 사용 중
+    # KeyboardInterrupt로 죽으면 부모의 close()가 해당 락에서 멈출 수 있다.
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    except (AttributeError, OSError, ValueError):
+        pass
     try:
         try:
             os.nice(10)
@@ -407,13 +418,16 @@ class WebPreview:
             return
         self._closed = True
         self._shared["state"].value = 3
-        self._shared["stop"].set()
-        if self._process is not None:
-            self._process.join(timeout=3.0)
-            if self._process.is_alive():
-                self._process.terminate()
-                self._process.join(timeout=1.0)
-            self._process.close()
+        process = self._process
+        if process is not None:
+            # 이미 비정상 종료한 자식의 공유 동기화 객체를 건드리지 않는다.
+            if process.is_alive():
+                self._shared["stop"].set()
+            process.join(timeout=3.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1.0)
+            process.close()
             self._process = None
 
     def __enter__(self):

@@ -103,7 +103,7 @@ function Get-PikaConnection {
         throw "PIKA_SSH_USER 형식이 안전하지 않습니다: $userName"
     }
     $sshPort = Assert-PikaInteger "PIKA_SSH_PORT" (Get-PikaValue $Values "PIKA_SSH_PORT" "22") 1 65535
-    $keyPath = Resolve-PikaPath (Get-PikaValue $Values "PIKA_SSH_KEY" "~\.ssh\id_ed25519_pika")
+    $keyPath = Resolve-PikaPath (Get-PikaValue $Values "PIKA_SSH_KEY" "~\.ssh\id_ed25519_pika_auto")
     return @{
         Host = $hostName
         User = $userName
