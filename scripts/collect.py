@@ -32,6 +32,7 @@ from pika_win.episode_writer import EpisodeWriterProcess  # noqa: E402
 from pika_win.gesture import GripperGestureDetector, calibrate_open_closed  # noqa: E402
 from pika_win.pedal import find_pedal_devices, open_pedal  # noqa: E402
 from pika_win.sdk_logging import quiet_pika_sdk_info  # noqa: E402
+from pika_win.web_preview import WebPreview  # noqa: E402
 
 log = logging.getLogger("collect")
 
@@ -650,8 +651,20 @@ def main():
                          "변환기가 색-grounded 프롬프트 배정. 박스는 색-매칭(coordinated)이라 별도 표기 불필요. "
                          "미지정/레거시 데이터는 normal로 간주.")
     ap.add_argument("--no-realsense", default=False, action="store_true")
-    ap.add_argument("--preview", default=False, action="store_true",
-                    help="좌|우 RGB 실시간 OpenCV 창 표시(15Hz 렌더). 창에서 'b'=REC 토글, 'q'=창만 닫기")
+    preview_group = ap.add_mutually_exclusive_group()
+    preview_group.add_argument("--preview", default=False, action="store_true",
+                               help="좌|우 RGB 로컬 OpenCV 창 표시(15Hz 렌더). "
+                                    "창에서 'b'=REC 토글, 'q'=창만 닫기")
+    preview_group.add_argument("--web-preview", default=False, action="store_true",
+                               help="수집과 격리된 읽기 전용 MJPEG 프리뷰(SSH 터널용)")
+    ap.add_argument("--web-preview-port", type=int, default=8765,
+                    help="웹 프리뷰 localhost 포트(기본 8765)")
+    ap.add_argument("--web-preview-fps", type=float, default=10.0,
+                    help="웹 프리뷰 목표 FPS(0.1~30, 기본 10)")
+    ap.add_argument("--web-preview-tile-width", type=int, default=320,
+                    help="웹 프리뷰의 카메라 한 장 너비(80~1280, 기본 320)")
+    ap.add_argument("--web-preview-jpeg-quality", type=int, default=70,
+                    help="웹 프리뷰 JPEG 품질(20~95, 기본 70)")
     ap.add_argument("--no-fisheye", default=False, action="store_true",
                     help="그리퍼 어안 카메라 수집 비활성화")
     ap.add_argument("--no-depth", default=False, action="store_true",
@@ -701,6 +714,14 @@ def main():
     ap.add_argument("--png-depth-compression", type=int, default=-1,
                     help="depth PNG compression level(0~9). 음수=OpenCV 기본값")
     a = ap.parse_args()
+    if not (1 <= a.web_preview_port <= 65535):
+        ap.error("--web-preview-port는 1~65535여야 합니다")
+    if not (0.1 <= a.web_preview_fps <= 30.0):
+        ap.error("--web-preview-fps는 0.1~30이어야 합니다")
+    if not (80 <= a.web_preview_tile_width <= 1280):
+        ap.error("--web-preview-tile-width는 80~1280이어야 합니다")
+    if not (20 <= a.web_preview_jpeg_quality <= 95):
+        ap.error("--web-preview-jpeg-quality는 20~95여야 합니다")
     signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
 
     logging.basicConfig(
@@ -752,11 +773,30 @@ def main():
     # 하드웨어 스레드(RealSense/pose/fisheye)가 시작되기 전(메인 스레드 단독) 시점에
     # 디스크 쓰기 전담 writer 프로세스를 fork 로 생성 → fork-after-threads 위험 회피.
     writer = EpisodeWriterProcess()
+    web_preview = None
     try:
         rec.start()  # ← 트래커 개수로 단일/양팔 자동 결정
 
         names = rec.arm_names()
         n = rec.n_arms
+        if a.web_preview:
+            try:
+                # spawn 자식이라 이미 시작된 하드웨어 스레드를 상속하지 않는다.
+                web_preview = WebPreview(
+                    names,
+                    fps=a.web_preview_fps,
+                    tile_width=a.web_preview_tile_width,
+                    jpeg_quality=a.web_preview_jpeg_quality,
+                    port=a.web_preview_port,
+                    episode=a.start_index,
+                )
+                log.info("[web-preview] http://127.0.0.1:%d  %.1fFPS tile=%dpx JPEG=%d "
+                         "(읽기 전용, SSH tunnel 권장)",
+                         web_preview.port, a.web_preview_fps,
+                         a.web_preview_tile_width, a.web_preview_jpeg_quality)
+            except Exception as e:  # noqa: BLE001 -- 프리뷰 실패는 수집을 막지 않는다
+                log.warning("[web-preview] 시작 실패(%s) -- 수집은 계속됩니다", e)
+                web_preview = None
         dets = []
         for ai, name in enumerate(names):
             if a.skip_gripper_calib:
@@ -771,6 +811,11 @@ def main():
             log.info("[gesture][%s] enter_closed=%.1f enter_open=%.1f dir=%+.0f window=%.1fs min_gap=%.0fms",
                      name, det.enter_closed, det.enter_open, det.dir, det.double_window, det.min_pinch_gap * 1e3)
     except BaseException:
+        if web_preview is not None:
+            try:
+                web_preview.close()
+            except Exception:
+                log.exception("[web-preview] 초기화 실패 후 종료 오류")
         rec.stop()
         writer.close()
         raise
@@ -932,6 +977,22 @@ def main():
                         log.info("○ IDLE 대기   next=episode_%03d   saved=%d   (%s = REC 시작)",
                                  ep, saved, toggle_desc)
 
+            # 웹 프리뷰는 읽기 전용이다. 공유 버퍼가 바쁘면 publish가 즉시 프레임을
+            # 버리며, resize/JPEG/socket write는 전부 별도 프로세스에서 수행된다.
+            if web_preview is not None:
+                try:
+                    if not web_preview.publish(fr, recording=recording, episode=ep):
+                        log.warning("[web-preview] 프로세스가 종료됨 -- 수집은 계속됩니다")
+                        web_preview.close()
+                        web_preview = None
+                except Exception as e:  # noqa: BLE001 -- 프리뷰 오류는 수집과 격리
+                    log.warning("[web-preview] publish 실패(%s) -- 수집은 계속됩니다", e)
+                    try:
+                        web_preview.close()
+                    except Exception:
+                        pass
+                    web_preview = None
+
             if recording:
                 if started_this_tick:
                     pass
@@ -1001,6 +1062,14 @@ def main():
             saved += 1
     finally:
         _ignore_shutdown_signals()
+        if web_preview is not None:
+            try:
+                stats = web_preview.stats()
+                web_preview.close()
+                log.info("[web-preview] 종료 published=%d dropped=%d",
+                         stats["published"], stats["dropped"])
+            except Exception:
+                log.exception("[web-preview] 종료 오류 -- 수집 데이터 저장은 계속합니다")
         try:
             if saveq.pending_count() > 0:
                 log.info("[shutdown] 저장 대기 중: %s", saveq.status())

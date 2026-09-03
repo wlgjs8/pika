@@ -7,7 +7,7 @@ source scripts/_venv.sh
 # shellcheck source=scripts/_pedal.sh
 source scripts/_pedal.sh
 
-# 90fps RGB-only 수집 (어안·depth 비활성, 뷰어 없음).
+# 90fps RGB-only 수집 (어안·depth 비활성, 수집과 격리된 웹 프리뷰).
 #
 # D405 는 640x480 에서 RGB 90fps 를 네이티브 지원한다(실측 89.5fps, drop 0).
 # depth 를 끄면 스트림뿐 아니라 rs.align(depth->color) 도 사라져 프레임당 비용이 줄고,
@@ -43,11 +43,40 @@ ARGS=()
 # 어안/depth 를 다시 켜려면: PIKA_FISHEYE=1 / PIKA_DEPTH=1
 [[ "${PIKA_FISHEYE:-0}" == "1" ]] || ARGS+=(--no-fisheye)
 [[ "${PIKA_DEPTH:-0}"   == "1" ]] || ARGS+=(--no-depth)
-# 실시간 좌|우 RGB 프리뷰 창(15Hz 렌더, 창에서 'b'=REC 토글). 끄려면 PIKA_PREVIEW=0
-[[ "${PIKA_PREVIEW:-1}" == "1" ]] && ARGS+=(--preview)
+# 프리뷰 기본값은 localhost MJPEG(10FPS). resize/JPEG/network는 별도 프로세스가
+# 담당하고 수집 측 공유 버퍼는 non-blocking/latest-only라 느린 client를 기다리지 않는다.
+#   PIKA_PREVIEW=0             전체 프리뷰 끄기(기존 env 호환)
+#   PIKA_PREVIEW_MODE=x11      예전 OpenCV/X11 창 사용
+#   PIKA_PREVIEW_MODE=off      전체 프리뷰 끄기
+PREVIEW_ENABLED="${PIKA_PREVIEW:-1}"
+PREVIEW_MODE="${PIKA_PREVIEW_MODE:-web}"
+if [[ "$PREVIEW_ENABLED" != "1" ]]; then
+  PREVIEW_MODE="off"
+fi
+case "$PREVIEW_MODE" in
+  web)
+    ARGS+=(
+      --web-preview
+      --web-preview-port "${PIKA_PREVIEW_PORT:-8765}"
+      --web-preview-fps "${PIKA_PREVIEW_FPS:-10}"
+      --web-preview-tile-width "${PIKA_PREVIEW_TILE_WIDTH:-320}"
+      --web-preview-jpeg-quality "${PIKA_PREVIEW_JPEG_QUALITY:-70}"
+    )
+    ;;
+  x11)
+    ARGS+=(--preview)
+    ;;
+  off)
+    ;;
+  *)
+    echo "[collect] 잘못된 PIKA_PREVIEW_MODE=$PREVIEW_MODE (web|x11|off 중 선택)" >&2
+    exit 2
+    ;;
+esac
 
 echo "[collect] ${HZ}Hz 기록 / RealSense ${RS_FPS}fps RGB-only / json=$RS_JSON"
 echo "[collect] 발판(녹화 토글): $PEDAL_DEVICE"
+echo "[collect] 프리뷰: $PREVIEW_MODE"
 
 exec "${PY_CMD[@]}" scripts/collect.py \
   --hz "$HZ" \

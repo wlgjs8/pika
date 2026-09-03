@@ -378,6 +378,43 @@ RealSense advanced-mode JSON 은 **robotics_lab 것을 경로로 직접 참조**
 | `PIKA_FISHEYE` / `PIKA_DEPTH` | 0 / 0 | `1` 로 두면 어안/depth 를 다시 켬 |
 | `PIKA_ENCODE_WORKERS` | 4 | PNG 인코딩 worker 수 |
 | `PEDAL_DEVICE` | 1구 발판 by-path (`scripts/_pedal.sh`) | 녹화 토글 발판 |
+| `PIKA_PREVIEW_MODE` | `web` | `web`=격리 MJPEG, `x11`=기존 OpenCV 창, `off`=끔 |
+| `PIKA_PREVIEW_FPS` | 10 | 웹 프리뷰 FPS(불안정한 Wi-Fi에서는 5 권장) |
+| `PIKA_PREVIEW_TILE_WIDTH` | 320 | 웹 프리뷰에서 카메라 한 장의 가로 픽셀 수 |
+| `PIKA_PREVIEW_JPEG_QUALITY` | 70 | 웹 프리뷰 JPEG 품질(20~95) |
+| `PIKA_PREVIEW_PORT` | 8765 | `127.0.0.1`에만 열리는 웹 프리뷰 포트 |
+
+### Windows에서 저지연 프리뷰와 수집을 한 번에 실행
+
+`run_collect_fast.sh`의 기본 프리뷰는 X11 창이 아니라 별도 프로세스의 10fps MJPEG입니다.
+수집 프로세스는 공유 버퍼에 non-blocking으로 최신 프레임만 전달하며, JPEG 인코딩과
+네트워크 쓰기는 자식 프로세스에서 수행됩니다. client가 느리면 보기용 프레임만 버리고
+90Hz 수집 루프는 기다리지 않습니다. 서버는 `127.0.0.1`에만 bind되므로 SSH 터널 없이
+공유기망에서 직접 접근할 수 없습니다.
+
+Windows client에서는 저장소의 `client\windows` 폴더만 복사해도 됩니다.
+
+1. `setup_ssh_key.cmd`를 실행합니다. 처음이면 `.env.example`을 `.env`로 복사하고 메모장을
+   열어 줍니다. 기본 수집 PC 주소는 `172.28.61.4`, 사용자는 `plaif`입니다.
+2. 메모장을 저장하고 닫은 뒤 안내에 따라 SSH 비밀번호를 한 번 입력합니다. 이후 사용할
+   키에는 자동 실행을 위해 passphrase를 비워 두거나 Windows `ssh-agent`를 사용합니다.
+3. 다음부터는 `start_collect_preview.cmd`만 실행합니다. 원격 수집 로그가 같은 창에 나오고,
+   준비되면 `http://127.0.0.1:8765/`가 기본 브라우저로 자동 열립니다.
+4. 창에서 `b`로 녹화를 토글하거나 수집 PC에 연결된 발판을 사용합니다. `Ctrl+C`를 누르면
+   마지막 에피소드 저장 후 원격 수집과 SSH 터널이 함께 종료됩니다.
+
+`.env`에는 SSH 비밀번호를 넣지 않습니다. Wi-Fi에서 영상이 불안정하면
+`PIKA_PREVIEW_FPS=5`로 낮추세요. 기존 X11 프리뷰가 꼭 필요할 때만 다음처럼 실행합니다.
+
+```bash
+PIKA_PREVIEW_MODE=x11 ./scripts/run_collect_fast.sh
+```
+
+프리뷰를 완전히 끄는 기존 설정도 유지됩니다.
+
+```bash
+PIKA_PREVIEW=0 ./scripts/run_collect_fast.sh
+```
 
 ### 발판은 `scripts/_pedal.sh` 한 곳에서 정한다
 
