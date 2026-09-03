@@ -1,8 +1,15 @@
 [CmdletBinding()]
-param([string]$EnvFile = (Join-Path $PSScriptRoot ".env"))
+param([string]$EnvFile = "")
 
 $ErrorActionPreference = "Stop"
-. (Join-Path $PSScriptRoot "_common.ps1")
+$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+if ([string]::IsNullOrWhiteSpace($scriptDirectory)) {
+    throw "스크립트 경로를 확인할 수 없습니다. setup_ssh_key.ps1을 파일로 실행하세요."
+}
+if ([string]::IsNullOrWhiteSpace($EnvFile)) {
+    $EnvFile = Join-Path $scriptDirectory ".env"
+}
+. (Join-Path $scriptDirectory "_common.ps1")
 
 try {
     $values = Read-PikaEnv $EnvFile

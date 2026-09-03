@@ -6,5 +6,5 @@ if not exist "%~dp0.env" (
   pause
   exit /b 1
 )
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_collect_preview.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_collect_preview.ps1" -EnvFile "%~dp0.env"
 if errorlevel 1 pause
