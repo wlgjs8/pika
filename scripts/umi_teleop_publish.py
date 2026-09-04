@@ -51,6 +51,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import struct
 import sys
@@ -646,6 +647,13 @@ def get_arguments(argv=None):
                     help="libsurvive 에 그대로 넘길 인자(반복 가능). 값이 '-' 로 시작하면 "
                          "argparse 가 옵션으로 오인하므로 **= 형식**을 써야 한다: "
                          "--survive-arg=--poser --survive-arg=MPFIT")
+    ap.add_argument("--survive-exclude-id", action="append", default=None, metavar="HEXID",
+                    # 기본값은 pika_win.libsurvive_config.EXCLUDED_IDS (단일 출처).
+                    help="이 OOTX id 의 라이트하우스를 추적/해에서 제외한다(반복 가능). "
+                         "공용 공간에서 **다른 사용자의 베이스스테이션**이 켜져도 우리 해에 "
+                         "섞이지 않게 한다. libsurvive 의 lighthouse-N-disable 은 N 이 채널이 "
+                         "아니라 **슬롯 인덱스**라서 재캘리브레이션마다 달라질 수 있는데, "
+                         "여기서는 매 실행 config 에서 id -> 슬롯을 다시 찾으므로 안전하다.")
     ap.add_argument("--survive-config", default=None,
                     help="라이트하우스 해 저장/재사용 경로(기본 config/libsurvive_config.json). "
                          "실행 간 월드 프레임을 고정하려면 같은 파일을 계속 써야 한다.")
@@ -717,8 +725,14 @@ def survive_options(a):
         opts["target_hz"] = float(a.survive_target_hz)
     if getattr(a, "survive_stale_timeout", None):
         opts["stale_timeout"] = float(a.survive_stale_timeout)
-    if getattr(a, "survive_arg", None):
-        opts["extra_args"] = list(a.survive_arg)
+    from pika_win.libsurvive_config import exclude_args
+    extra = list(getattr(a, "survive_arg", None) or [])
+    from pika_win.libsurvive_config import default_exclude_ids
+    ids = getattr(a, "survive_exclude_id", None)
+    extra += exclude_args(ids if ids is not None else default_exclude_ids(),
+                          opts.get("config_path"), log=log.info)
+    if extra:
+        opts["extra_args"] = extra
     return opts
 
 

@@ -329,6 +329,22 @@ def _looks_like_windows_com(port):
     return isinstance(port, str) and port.upper().startswith("COM")
 
 
+def _survive_pose_options(a):
+    """--survive-exclude-id -> EpisodeRecorder(pose_options=...).
+
+    텔레옵(umi_teleop_publish)과 **같은 기본값**을 쓴다. 수집과 텔레옵이 서로 다른
+    라이트하우스 집합으로 돌면 월드 프레임이 달라져, 수집한 데이터와 실기 동작이
+    조용히 어긋난다.
+    """
+    if (a.pose_backend or "survive") != "survive":
+        return {}
+    ids = a.survive_exclude_id
+    if ids is None:
+        ids = default_exclude_ids()
+    extra = exclude_args(ids, log=log.info)
+    return {"extra_args": extra} if extra else {}
+
+
 def build_arms(a):
     """팔 번들 생성. config/arms.json 이 있으면 그것을 우선(좌/우 고정), 없으면 CLI 리스트."""
     # 1) config 파일이 있으면 source of truth (identify_arms.py 로 저장한 좌/우 고정 매핑)
@@ -682,6 +698,12 @@ def main():
                     help="포즈 백엔드: survive=libsurvive(GUI 불필요, 기본), "
                          "steamvr=OpenVR(SteamVR 실행 필요). 월드 원점이 서로 다르므로 "
                          "한 데이터셋 안에서 섞지 말 것(HDF5 attrs pose_frame/pose_backend 로 구분)")
+    ap.add_argument("--survive-exclude-id", action="append", default=None, metavar="HEXID",
+                    help="이 OOTX id 의 라이트하우스를 추적/해에서 제외(반복 가능). "
+                         "미지정 시 pika_win.libsurvive_config.EXCLUDED_IDS 를 쓴다 — "
+                         "공용 공간의 다른 사용자 스테이션이 켜져 있어도 우리 3대 구성만으로 "
+                         "수집하기 위한 기본값. 제외 없이 받으려면 빈 값으로 덮어쓸 것: "
+                         "PIKA_LIGHTHOUSE_EXCLUDE_IDS= scripts/collect.py ...")
     ap.add_argument("--require-pose", action="store_true",
                     help="포즈 백엔드와 active tracker pose가 유효하지 않으면 시작하지 않음")
     ap.add_argument("--require-all-trackers", action="store_true",
@@ -765,7 +787,8 @@ def main():
                               None if a.png_depth_compression < 0 else a.png_depth_compression),
                           encode_workers=(None if a.encode_workers <= 0 else a.encode_workers),
                           arm_bolt_colors=a.arm_bolt_colors,
-                          pose_backend=a.pose_backend)
+                          pose_backend=a.pose_backend,
+                          pose_options=_survive_pose_options(a))
     log.info("[collect] arm_bolt_colors=%s (per-session bolt assignment -> HDF5 attr)", a.arm_bolt_colors)
     log.info("[save] max_pending=%d encode_workers=%d png_compression=%d depth_png=%s",
              max(1, a.save_max_pending), rec.encode_workers, rec.png_compression,

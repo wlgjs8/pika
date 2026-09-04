@@ -37,6 +37,12 @@ fi
 # 이 표준 래퍼는 양팔 전용이다. config 의 트래커가 하나라도 없으면 SINGLE 로 조용히
 # 내려가지 않고 Sense 연결/UDP 송신 전에 실패시킨다. 단팔 진단은 Python 스크립트를
 # --require-all-trackers 없이 직접 실행한다.
+# 다른 사용자의 베이스스테이션 제외는 **발행자 기본값**이다
+# (pika_win/libsurvive_config.py 의 EXCLUDED_IDS — 텔레옵·수집·캘리브가 공유하는 단일 출처).
+# 여기서 다시 지정하지 않는다. 임시로 바꾸려면:
+#   PIKA_LIGHTHOUSE_EXCLUDE_IDS="" scripts/run_umi_teleop_publish.sh        # 제외 없음
+#   PIKA_LIGHTHOUSE_EXCLUDE_IDS="5a2c575b 다른id" scripts/run_umi_teleop_publish.sh
+
 exec "${PY_CMD[@]}" scripts/umi_teleop_publish.py \
   --pedal \
   --pedal-device "$PEDAL_DEVICE" \

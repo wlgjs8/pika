@@ -13,6 +13,7 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
+from pika_win.libsurvive_config import default_exclude_ids, exclude_args  # noqa: E402
 from pika_win.pose_survive import PoseSurvive  # noqa: E402
 
 
@@ -30,6 +31,13 @@ def main():
                     help="저장된 라이트하우스 해를 버리고 새로 캘리브레이션. "
                          "실행 중 트래커를 작업 공간 전체에 걸쳐 천천히 움직여야 "
                          "scene solve 가 수렴한다(가만히 두면 발산)")
+    ap.add_argument("--exclude-id", action="append", default=None, metavar="HEXID",
+                    help="이 OOTX id 의 라이트하우스를 추적/해에서 제외(반복 가능). "
+                         "공용 공간에서 다른 사용자의 스테이션이 켜져 있어도 우리 해에 "
+                         "섞이지 않게 한다. 슬롯 번호는 매 실행 config 에서 다시 찾으므로 "
+                         "재캘리브레이션으로 슬롯이 바뀌어도 안전하다. "
+                         "**--recalibrate 와 같이 쓸 때 특히 중요** — 안 그러면 남의 "
+                         "스테이션까지 같이 풀어서 해에 넣는다.")
     a = ap.parse_args()
 
     want = {}
@@ -38,9 +46,12 @@ def main():
         want = {v.get("tracker_sn"): k for k, v in arms.items() if v.get("tracker_sn")}
         print(f"[cfg] arms.json 기대 트래커: {want}")
 
+    ids = a.exclude_id if a.exclude_id is not None else default_exclude_ids()
+    extra = exclude_args(ids, a.survive_config, log=print)
     pose = PoseSurvive(apply_gripper_offset=a.tip,
                        config_path=a.survive_config,
                        force_calibrate=a.recalibrate,
+                       extra_args=extra,
                        # arms.json에 설정된 트래커가 모두 붙을 때까지 기다려야
                        # 한쪽이 늦게 올라오는 양팔 상태도 정확히 진단할 수 있다.
                        warmup_expect=list(want)).connect()
