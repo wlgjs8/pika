@@ -333,6 +333,42 @@ def _looks_like_windows_com(port):
     return isinstance(port, str) and port.upper().startswith("COM")
 
 
+def _lan_ip():
+    """기본 경로로 나가는 인터페이스의 IP. 실패하면 None (안내용일 뿐이라 치명적이지 않다)."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("192.0.2.1", 1))   # TEST-NET-1, 실제로 패킷은 안 나간다
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return None
+
+
+def _log_preview_urls(host, port, a):
+    """프리뷰 접속 방법을 로컬/원격 둘 다 찍는다.
+
+    수집은 이 PC 에서 직접 돌리기도 하고 SSH 로 들어와 돌리기도 하는데, 예전에는
+    127.0.0.1 주소만 찍혀서 원격에서 어떻게 봐야 하는지가 로그에 없었다.
+    """
+    log.info("[web-preview] %.1fFPS tile=%dpx JPEG=%d (읽기 전용)",
+             a.web_preview_fps, a.web_preview_tile_width, a.web_preview_jpeg_quality)
+    log.info("[web-preview] 로컬 : http://127.0.0.1:%d", port)
+    if host in ("0.0.0.0", "::"):
+        ip = _lan_ip()
+        if ip:
+            log.info("[web-preview] LAN  : http://%s:%d", ip, port)
+        log.warning("[web-preview] 인증이 없습니다 — 신뢰된 망에서만 %s 로 여세요", host)
+    else:
+        import getpass
+        ip = _lan_ip() or "<이 PC>"
+        log.info("[web-preview] 원격 : ssh -N -L %d:127.0.0.1:%d %s@%s  후 위 로컬 주소",
+                 port, port, getpass.getuser(), ip)
+        log.info("[web-preview]        (LAN 에서 바로 열려면 PIKA_PREVIEW_HOST=0.0.0.0)")
+
+
 def _survive_pose_options(a):
     """--survive-exclude-id -> EpisodeRecorder(pose_options=...).
 
@@ -700,6 +736,11 @@ def main():
                                     "창에서 'b'=REC 토글, 'q'=창만 닫기")
     preview_group.add_argument("--web-preview", default=False, action="store_true",
                                help="수집과 격리된 읽기 전용 MJPEG 프리뷰(SSH 터널용)")
+    ap.add_argument("--web-preview-host", default="127.0.0.1",
+                    help="웹 프리뷰 바인드 주소. 기본 127.0.0.1(이 PC 에서만). "
+                         "SSH 로 들어와서 볼 때는 포트포워딩(-L)이 기본이고, "
+                         "LAN 의 다른 기기에서 바로 열려면 0.0.0.0 으로 두되 "
+                         "**인증이 없다**는 점을 감안할 것(신뢰된 망 전용).")
     ap.add_argument("--web-preview-port", type=int, default=8765,
                     help="웹 프리뷰 localhost 포트(기본 8765)")
     ap.add_argument("--web-preview-fps", type=float, default=10.0,
@@ -837,13 +878,11 @@ def main():
                     fps=a.web_preview_fps,
                     tile_width=a.web_preview_tile_width,
                     jpeg_quality=a.web_preview_jpeg_quality,
+                    host=a.web_preview_host,
                     port=a.web_preview_port,
                     episode=a.start_index,
                 )
-                log.info("[web-preview] http://127.0.0.1:%d  %.1fFPS tile=%dpx JPEG=%d "
-                         "(읽기 전용, SSH tunnel 권장)",
-                         web_preview.port, a.web_preview_fps,
-                         a.web_preview_tile_width, a.web_preview_jpeg_quality)
+                _log_preview_urls(a.web_preview_host, web_preview.port, a)
             except Exception as e:  # noqa: BLE001 -- 프리뷰 실패는 수집을 막지 않는다
                 log.warning("[web-preview] 시작 실패(%s) -- 수집은 계속됩니다", e)
                 web_preview = None

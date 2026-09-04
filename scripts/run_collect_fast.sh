@@ -45,18 +45,51 @@ ARGS=()
 [[ "${PIKA_DEPTH:-0}"   == "1" ]] || ARGS+=(--no-depth)
 # 프리뷰 기본값은 localhost MJPEG(10FPS). resize/JPEG/network는 별도 프로세스가
 # 담당하고 수집 측 공유 버퍼는 non-blocking/latest-only라 느린 client를 기다리지 않는다.
+# 기본은 auto — **같은 명령을 로컬에서도 SSH 에서도 그대로** 쓰기 위한 것이다.
+#   로컬(디스플레이 있고 SSH 아님) -> x11 : 기존 OpenCV 창. 'b'=REC 토글, 'q'=창 닫기.
+#                                          수집 중 실제로 쓰는 조작이 여기 다 들어있다.
+#   SSH / 디스플레이 없음          -> web : 브라우저 MJPEG.
+#
+# SSH 세션이면 DISPLAY 가 있어도 web 을 고른다. X11 forwarding 으로 영상 창을 띄우면
+# 프레임마다 전체 비트맵이 넘어가 링크를 다 먹는다 — 그 상황에서는 JPEG 스트림이 낫다.
+#
 #   PIKA_PREVIEW=0             전체 프리뷰 끄기(기존 env 호환)
-#   PIKA_PREVIEW_MODE=x11      예전 OpenCV/X11 창 사용
+#   PIKA_PREVIEW_MODE=x11      강제 OpenCV 창
+#   PIKA_PREVIEW_MODE=web      강제 브라우저
 #   PIKA_PREVIEW_MODE=off      전체 프리뷰 끄기
+#   PIKA_PREVIEW_HOST=0.0.0.0  web 을 LAN 에 공개(인증 없음 — 신뢰된 망 전용)
+#
+# web 접속 방법(로컬 주소 / SSH -L 명령 / LAN 주소)은 기동 로그가 찍어준다.
 PREVIEW_ENABLED="${PIKA_PREVIEW:-1}"
-PREVIEW_MODE="${PIKA_PREVIEW_MODE:-web}"
+PREVIEW_MODE="${PIKA_PREVIEW_MODE:-auto}"
 if [[ "$PREVIEW_ENABLED" != "1" ]]; then
   PREVIEW_MODE="off"
+fi
+
+if [[ "$PREVIEW_MODE" == "auto" ]]; then
+  # 디스플레이가 없는데 DISPLAY 만 비어 있는 경우가 있어(tty 로그인 등) 실제 X 소켓을
+  # 찾아 채운다. X0 를 박지 않는 이유: 이 PC 는 :1 로 뜬다.
+  if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" && -z "${SSH_CONNECTION:-}" ]]; then
+    for _sock in /tmp/.X11-unix/X*; do
+      [[ -S "$_sock" ]] || continue
+      export DISPLAY=":${_sock##*/X}"
+      [[ -z "${XAUTHORITY:-}" && -r "$HOME/.Xauthority" ]] && export XAUTHORITY="$HOME/.Xauthority"
+      break
+    done
+  fi
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    PREVIEW_MODE="web";  PREVIEW_WHY="SSH 세션"
+  elif [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    PREVIEW_MODE="x11";  PREVIEW_WHY="로컬 디스플레이 ${DISPLAY:-$WAYLAND_DISPLAY}"
+  else
+    PREVIEW_MODE="web";  PREVIEW_WHY="디스플레이 없음"
+  fi
 fi
 case "$PREVIEW_MODE" in
   web)
     ARGS+=(
       --web-preview
+      --web-preview-host "${PIKA_PREVIEW_HOST:-127.0.0.1}"
       --web-preview-port "${PIKA_PREVIEW_PORT:-8765}"
       --web-preview-fps "${PIKA_PREVIEW_FPS:-10}"
       --web-preview-tile-width "${PIKA_PREVIEW_TILE_WIDTH:-320}"
@@ -69,14 +102,14 @@ case "$PREVIEW_MODE" in
   off)
     ;;
   *)
-    echo "[collect] 잘못된 PIKA_PREVIEW_MODE=$PREVIEW_MODE (web|x11|off 중 선택)" >&2
+    echo "[collect] 잘못된 PIKA_PREVIEW_MODE=$PREVIEW_MODE (auto|web|x11|off 중 선택)" >&2
     exit 2
     ;;
 esac
 
 echo "[collect] ${HZ}Hz 기록 / RealSense ${RS_FPS}fps RGB-only / json=$RS_JSON"
 echo "[collect] 발판(녹화 토글): $PEDAL_DEVICE"
-echo "[collect] 프리뷰: $PREVIEW_MODE"
+echo "[collect] 프리뷰: $PREVIEW_MODE${PREVIEW_WHY:+ (auto: $PREVIEW_WHY)}${PIKA_PREVIEW_HOST:+ bind=$PIKA_PREVIEW_HOST}"
 
 exec "${PY_CMD[@]}" scripts/collect.py \
   --hz "$HZ" \
