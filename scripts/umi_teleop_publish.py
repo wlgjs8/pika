@@ -771,8 +771,8 @@ def survive_options(a):
         opts["target_hz"] = float(a.survive_target_hz)
     if getattr(a, "survive_stale_timeout", None):
         opts["stale_timeout"] = float(a.survive_stale_timeout)
-    from pika_win.libsurvive_config import exclude_args
-    extra = list(getattr(a, "survive_arg", None) or [])
+    from pika_win.libsurvive_config import exclude_args, reference_args
+    extra = reference_args() + list(getattr(a, "survive_arg", None) or [])
     from pika_win.libsurvive_config import default_exclude_ids
     ids = getattr(a, "survive_exclude_id", None)
     extra += exclude_args(ids if ids is not None else default_exclude_ids(),

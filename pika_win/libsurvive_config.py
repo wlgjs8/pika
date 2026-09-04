@@ -25,8 +25,24 @@ _BLOCK = re.compile(r'"lighthouse(\d+)":\{(.*?)\n\}', re.S)
 # 스테이션 구성이 바뀌면 여기만 고치면 된다. 임시로 덮어쓰려면 환경변수:
 #   PIKA_LIGHTHOUSE_EXCLUDE_IDS="5a2c575b 다른id"   (빈 문자열이면 제외 없음)
 #
-# 2026-09-04 기준 우리 3대: ch2 4b4ffb83(기준) / ch0 e7acbce5 / ch1 d51ee7eb(천장)
-EXCLUDED_IDS = ("5a2c575b",)
+# 2026-09-04 기준 실제로 쓰는 것은 2대: ch2 4b4ffb83(**기준 lighthouse**) / ch0 e7acbce5.
+#
+# 제외 2건:
+#   5a2c575b (ch3) — 다른 사용자 것. 위치를 못 바꾼다.
+#   d51ee7eb (ch1) — 우리가 천장에 올렸던 대. 각도를 고친 뒤에도 솔버 잔차가 다른 둘보다
+#                    한 자릿수 나빴다(acc err 0.011~0.015 vs 0.0002~0.0006). 빼고 나니
+#                    MPFIT up err 가 0.0090 -> 0.0003 으로 30배 좋아졌다. 즉 이 대는
+#                    기여보다 오염이 컸다.
+#
+# 스테이션을 **빼는 데는 재캘리브레이션이 필요 없다** — 저장된 해는 각 대를 기준 대에
+# 대해 기술하므로 남는 대들의 좌표가 그대로다. 반대로 **다시 켤 때는 반드시 재캘리브**
+# 해야 한다: d51ee7eb 항목은 지금 1sigma [0,0,0] 인 미해결 상태로 남아 있어서, 그냥
+# 켜면 그 나쁜 사전값이 해에 들어간다.
+#
+# **4b4ffb83 은 끄지 말 것.** 기준 lighthouse 라 빼면 libsurvive 가 다른 대를 기준으로
+# 다시 잡고 월드 프레임이 통째로 바뀐다. 텔레옵은 몸체 상대 변위라 조작 방향은 유지되지만
+# 그 전후 수집분은 좌표계가 달라진다.
+EXCLUDED_IDS = ("5a2c575b", "d51ee7eb")
 
 
 def default_exclude_ids():
@@ -34,6 +50,34 @@ def default_exclude_ids():
     if env is not None:
         return [x for x in env.split() if x]
     return list(EXCLUDED_IDS)
+
+
+# 기준(reference) lighthouse 를 명시적으로 고정한다.
+#
+# libsurvive 의 기본 규칙은 src/poser.c 에 있다: `reference-basestation` 이 0(미설정)
+# 이면 **해가 풀린 것 중 BaseStationID 가 가장 작은 대**를 기준으로 잡는다.
+#   0x4b4ffb83 = 1263532931  ch2 우리   <- 넷 중 최소, 그래서 지금 기준이다
+#   0x5a2c575b = 1512855387  ch3 타 사용자
+#   0xd51ee7eb = 3575572459  ch1 천장
+#   0xe7acbce5 = 3886857445  ch0 우리
+#
+# 즉 우리가 위에서 어느 대를 빼든 기준은 바뀌지 않는다 — 이게 "빼는 데는 재캘리브가
+# 필요 없다" 의 근거다. 다만 그건 **우연히** 우리 대의 id 가 가장 작아서 성립한다.
+# 다른 사용자가 더 작은 id 의 대를 켜면 기준이 조용히 넘어가고 월드 프레임이 통째로
+# 돌아간다 — 로그 한 줄 말고는 티도 안 난다. 그래서 못 박는다.
+#
+# CONFIG_STRING 은 strtol(.., 0) 으로 읽히므로 "0x.." 표기가 그대로 통한다
+# (libsurvive src/survive_config.c config_entry_as_uint32_t).
+REFERENCE_ID = "4b4ffb83"
+
+
+def reference_args(hex_id=None):
+    """기준 lighthouse 고정 인자. 빈 값으로 끄면 libsurvive 기본(최소 id)로 돌아간다."""
+    hex_id = REFERENCE_ID if hex_id is None else hex_id
+    hex_id = os.environ.get("PIKA_LIGHTHOUSE_REFERENCE_ID", hex_id).strip()
+    if not hex_id:
+        return []
+    return ["--reference-basestation", f"0x{hex_id.lower().replace('0x', '')}"]
 
 
 def lighthouses(path=None):

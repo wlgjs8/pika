@@ -28,7 +28,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
 from pika_win.libsurvive_config import (  # noqa: E402
-    default_exclude_ids, exclude_args)
+    default_exclude_ids, exclude_args, reference_args)
 from pika_win.usb_topology import (  # noqa: E402
     realsense_sn_for_tracker, sense_port_for_tracker)
 from pika_win.recorder import EpisodeRecorder, ArmSpec  # noqa: E402
@@ -381,7 +381,7 @@ def _survive_pose_options(a):
     ids = a.survive_exclude_id
     if ids is None:
         ids = default_exclude_ids()
-    extra = exclude_args(ids, log=log.info)
+    extra = reference_args() + exclude_args(ids, log=log.info)
     return {"extra_args": extra} if extra else {}
 
 

@@ -13,7 +13,8 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from pika_win.libsurvive_config import default_exclude_ids, exclude_args  # noqa: E402
+from pika_win.libsurvive_config import (  # noqa: E402
+    default_exclude_ids, exclude_args, reference_args)
 from pika_win.pose_survive import PoseSurvive  # noqa: E402
 
 
@@ -47,7 +48,7 @@ def main():
         print(f"[cfg] arms.json 기대 트래커: {want}")
 
     ids = a.exclude_id if a.exclude_id is not None else default_exclude_ids()
-    extra = exclude_args(ids, a.survive_config, log=print)
+    extra = reference_args() + exclude_args(ids, a.survive_config, log=print)
     pose = PoseSurvive(apply_gripper_offset=a.tip,
                        config_path=a.survive_config,
                        force_calibrate=a.recalibrate,

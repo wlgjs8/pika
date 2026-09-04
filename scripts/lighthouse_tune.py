@@ -36,7 +36,8 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from pika_win.libsurvive_config import default_exclude_ids, exclude_args  # noqa: E402
+from pika_win.libsurvive_config import (  # noqa: E402
+    default_exclude_ids, exclude_args, reference_args)
 from pika_win.pose_math import (  # noqa: E402
     TIP_ROTATION_QUAT, TIP_TRANSLATION, quat_rotate_vec,
 )
@@ -191,7 +192,8 @@ def main():
     try:
         from pika_win.pose_survive import PoseSurvive
         ids = a.exclude_id if a.exclude_id is not None else default_exclude_ids()
-        extra = exclude_args(ids, LIVE_CONFIG, log=lambda m: tap.write(m + "\n"))
+        extra = reference_args() + exclude_args(
+            ids, LIVE_CONFIG, log=lambda m: tap.write(m + "\n"))
         pose = PoseSurvive(apply_gripper_offset=False, config_path=cfg,
                            warmup_sec=12.0, extra_args=extra).connect()
     except Exception as e:
