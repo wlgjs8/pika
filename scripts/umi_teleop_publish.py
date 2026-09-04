@@ -60,6 +60,8 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
+from pika_win.usb_topology import (  # noqa: E402
+    realsense_sn_for_tracker, sense_port_for_tracker)
 from pika_win.pedal import find_pedal_devices, open_pedal  # noqa: E402
 from pika_win.sdk_logging import quiet_pika_sdk_info  # noqa: E402
 
@@ -519,6 +521,49 @@ class PedalClutch:
 
 
 # ----------------------------- arms.json 로더 (collect.build_arms 의 최소 버전) -----------------------------
+def resolve_com_port(name, com_port, tracker_sn):
+    """arms.json 의 com_port 해석. "auto"(또는 미지정)면 트래커와 같은 USB 체인에서 찾는다.
+
+    by-path 를 박아두면 포트를 옮길 때마다 깨지고, 더 나쁘게는 **조용히 교차 배선**된다
+    (2026-09-04: left 의 com_port 가 right 유닛의 그리퍼를 가리켰는데 연결은 성공했다).
+    트래커와 그리퍼는 같은 PIKA Sense 유닛 = 같은 USB 체인이므로 그 결속으로 찾는 것이
+    유일하게 안전하다.
+    """
+    if com_port and str(com_port).lower() != "auto":
+        return com_port
+    if not tracker_sn:
+        raise SystemExit(f"[arms] {name}: com_port=auto 인데 tracker_sn 이 없습니다 — "
+                         f"자동 탐색은 트래커 기준입니다")
+    port = sense_port_for_tracker(tracker_sn)
+    if not port:
+        raise SystemExit(
+            f"[arms] {name}: 트래커 {tracker_sn} 과 같은 USB 체인에서 그리퍼 시리얼을 "
+            f"찾지 못했습니다. 트래커가 연결돼 있는지 확인하거나 arms.json 에 "
+            f"com_port 를 명시하세요 (ls -l /dev/serial/by-path/)")
+    log.info("[arms] %s: com_port 자동 = %s (트래커 %s 와 같은 체인)", name, port, tracker_sn)
+    return port
+
+
+def resolve_realsense_sn(name, sn, tracker_sn):
+    """"auto"(또는 미지정)면 트래커와 같은 유닛의 RealSense 시리얼을 찾는다.
+
+    RealSense 는 USB3 라 트래커(USB2)와 다른 버스에 올라오지만, 커널의 port/peer 가
+    같은 물리 허브의 두 트리를 이어주므로 유닛 결속은 유지된다.
+    """
+    if sn and str(sn).lower() != "auto":
+        return sn
+    if not tracker_sn:
+        return None
+    found = realsense_sn_for_tracker(tracker_sn)
+    if found:
+        log.info("[arms] %s: realsense_sn 자동 = %s (트래커 %s 와 같은 유닛)",
+                 name, found, tracker_sn)
+    else:
+        log.warning("[arms] %s: 트래커 %s 와 같은 유닛의 RealSense 를 찾지 못했습니다",
+                    name, tracker_sn)
+    return found
+
+
 def load_arms(config_path):
     """config/arms.json → ArmSpec 리스트(좌/우). pika_win.recorder.ArmSpec 사용."""
     from pika_win.recorder import ArmSpec
@@ -531,8 +576,9 @@ def load_arms(config_path):
             continue
         arms.append(ArmSpec(
             name,
-            com_port=d.get("com_port") or None,
-            realsense_sn=d.get("realsense_sn") or None,
+            com_port=resolve_com_port(name, d.get("com_port"), d.get("tracker_sn")),
+            realsense_sn=resolve_realsense_sn(name, d.get("realsense_sn"),
+                                              d.get("tracker_sn")),
             tracker_sn=d.get("tracker_sn") or None,
         ))
     if not arms:

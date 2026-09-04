@@ -27,6 +27,10 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
+from pika_win.libsurvive_config import (  # noqa: E402
+    default_exclude_ids, exclude_args)
+from pika_win.usb_topology import (  # noqa: E402
+    realsense_sn_for_tracker, sense_port_for_tracker)
 from pika_win.recorder import EpisodeRecorder, ArmSpec  # noqa: E402
 from pika_win.episode_writer import EpisodeWriterProcess  # noqa: E402
 from pika_win.gesture import GripperGestureDetector, calibrate_open_closed  # noqa: E402
@@ -357,6 +361,29 @@ def build_arms(a):
             arms = []
             for name, d in cfg.items():
                 com_port = d.get("com_port") or None
+                # "auto"/미지정 -> 트래커와 같은 USB 체인에서 그리퍼를 찾는다
+                # (텔레옵과 동일한 규칙; 교차 배선 방지)
+                if not com_port or str(com_port).lower() == "auto":
+                    tsn = d.get("tracker_sn")
+                    resolved = sense_port_for_tracker(tsn) if tsn else None
+                    if not resolved:
+                        raise SystemExit(
+                            f"[arms] {name}: 트래커 {tsn} 과 같은 USB 체인에서 그리퍼 "
+                            f"시리얼을 찾지 못했습니다 — 연결 확인 또는 arms.json 에 "
+                            f"com_port 명시")
+                    log.info("[arms] %s: com_port 자동 = %s (트래커 %s 와 같은 체인)",
+                             name, resolved, tsn)
+                    com_port = resolved
+                rs_sn = d.get("realsense_sn") or None
+                if not rs_sn or str(rs_sn).lower() == "auto":
+                    tsn = d.get("tracker_sn")
+                    rs_sn = realsense_sn_for_tracker(tsn) if tsn else None
+                    if rs_sn:
+                        log.info("[arms] %s: realsense_sn 자동 = %s (트래커 %s 와 같은 유닛)",
+                                 name, rs_sn, tsn)
+                    else:
+                        log.warning("[arms] %s: 트래커 %s 와 같은 유닛의 RealSense 를 "
+                                    "찾지 못했습니다", name, tsn)
                 if os.name != "nt" and _looks_like_windows_com(com_port):
                     log.warning("[config][%s] Linux에서 Windows COM 포트(%s)가 설정됨. "
                                 "config/arms.json을 /dev/serial/by-path/...로 갱신하거나 --config ''로 CLI 값을 쓰세요.",
@@ -364,7 +391,7 @@ def build_arms(a):
                 arms.append(ArmSpec(
                     name=name,
                     com_port=com_port,
-                    realsense_sn=d.get("realsense_sn") or None,
+                    realsense_sn=rs_sn,
                     tracker_sn=d.get("tracker_sn") or None,
                     fisheye_dev=d.get("fisheye_dev") or None,
                 ))
