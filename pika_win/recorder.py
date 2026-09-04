@@ -73,6 +73,7 @@ class EpisodeRecorder:
                  use_depth=True, rs_fps=30, rs_json=None,
                  settle=1.0, require_pose=False, require_all_trackers=False,
                  pose_valid_timeout=2.0, pose_tip_frame=False, pose_backend="survive",
+                 pose_options=None,
                  png_compression=1, png_depth_compression=None, encode_workers=None,
                  arm_bolt_colors="right=black,left=gray",
                  # ---- 레거시 단일-팔 호환 kwargs (arms 미지정 시 사용) ----
@@ -112,6 +113,10 @@ class EpisodeRecorder:
         # 포즈 백엔드: "survive"(libsurvive, GUI 불필요) / "steamvr"(OpenVR).
         # 백엔드마다 월드 원점이 다르므로 에피소드 attrs 에 함께 기록한다.
         self.pose_backend = str(pose_backend)
+        # 백엔드로 그대로 넘길 추가 인자(survive: config_path/stale_timeout/force_calibrate/
+        # extra_args/target_hz, steamvr: origin/device_class). 여기서 해석하지 않는다 —
+        # 백엔드마다 유효 키가 다르므로 호출부가 자기 백엔드에 맞는 것만 넣어야 한다.
+        self.pose_options = dict(pose_options or {})
         # 세션 단위 볼트-색 배정: 각 팔이 이번 세션에서 집는 볼트 색 (예: "right=black,left=gray"=normal,
         # "right=gray,left=black"=swap). 매 에피소드 HDF5 root attr `arm_bolt_colors`로 기록 →
         # 변환기가 색-grounded 프롬프트를 배정. 미지정/레거시 데이터는 normal(right=black,left=gray)로 간주.
@@ -132,12 +137,14 @@ class EpisodeRecorder:
         # 1) 포즈 리더 1개만 연결 — 모든 트래커가 공유
         if self.flags["pose"]:
             try:
+                pose_kwargs = {"target_hz": 250}
+                pose_kwargs.update(self.pose_options)
                 self.pose = make_pose_reader(
-                    self.pose_backend, target_hz=250,
+                    self.pose_backend,
                     apply_gripper_offset=self.pose_tip_frame,
                     # 설정된 트래커가 전부 붙을 때까지 기다린다 — libsurvive 는 기기별
                     # 획득 시각이 달라서, 안 기다리면 양팔 세션이 한쪽만 잡고 시작한다.
-                    warmup_expect=self._configured_tracker_sns()).connect()
+                    warmup_expect=self._configured_tracker_sns(), **pose_kwargs).connect()
                 log.info("[pose] %s 연결 (frame=%s)", BACKEND_LABELS.get(self.pose_backend,
                                                                         self.pose_backend),
                          "gripper_tip" if self.pose_tip_frame else "tracker_raw")

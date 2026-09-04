@@ -15,7 +15,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pika_win.pose_math import SampleSeqTracker  # noqa: E402
-from scripts.umi_teleop_publish import build_packet  # noqa: E402
+from scripts.umi_teleop_publish import PosePublishGate, build_packet  # noqa: E402
 
 POLL_HZ, NATIVE_HZ, PUB_HZ, DUR = 250.0, 120.0, 200.0, 4.0
 QUAT = (0.0, 0.0, 0.0, 1.0)
@@ -64,6 +64,60 @@ def test_build_packet_wire():
     assert "pose_fresh" not in pk3["left"] and "pose_seq" not in pk3["left"]  # 하위호환
 
 
+# ---- PosePublishGate: 고정 케이던스 vs 소스 이벤트 구동 ---------------------------
+GATE_SIDES = ("left", "right")
+
+
+def _drive_gate(poll_hz, src_hz, event_mode, dur=4.0, max_hold=0.02):
+    """합성 소스로 게이트를 구동 → (gate, side별 송신 패킷 수)."""
+    gate = PosePublishGate(GATE_SIDES, event_mode=event_mode, max_hold_sec=max_hold)
+    sent = {n: 0 for n in GATE_SIDES}
+    for k in range(int(poll_hz * dur)):
+        t = k / poll_hz
+        sides = {nm: {"pose_seq": int(t * src_hz[nm])} for nm in GATE_SIDES}
+        fresh = gate.freshness(sides)
+        send = gate.sides_to_send(fresh, t)
+        if any(send.values()):
+            gate.commit(sides, fresh, send, t)
+            for nm in GATE_SIDES:
+                if send[nm]:
+                    sent[nm] += 1
+    return gate, sent
+
+
+def test_fixed_cadence_drops_the_faster_tracker():
+    """구 동작 재현: 발행 198Hz 는 246Hz 소스를 데시메이트하고 125Hz 소스를 복제한다."""
+    gate, _ = _drive_gate(198.0, {"left": 125.0, "right": 246.0}, event_mode=False)
+    assert gate.skipped["right"] > 100, gate.skipped     # 빠른 쪽 샘플 유실
+    assert gate.skipped["left"] == 0
+    assert gate.dup["left"] > 100, gate.dup              # 느린 쪽 중복 송신
+    assert gate.dup["right"] == 0
+
+
+def test_event_mode_publishes_every_sample_exactly_once():
+    """좌우 갱신률이 2배 달라도 유실 0 / 중복 0, 각 side 는 자기 소스 레이트로 나간다."""
+    for src in ({"left": 125.0, "right": 246.0}, {"left": 246.0, "right": 246.0}):
+        gate, sent = _drive_gate(500.0, src, event_mode=True)
+        for nm in GATE_SIDES:
+            assert gate.skipped[nm] == 0, (src, nm, gate.skipped)
+            assert gate.dup[nm] == 0, (src, nm, gate.dup)
+            assert abs(sent[nm] / 4.0 - src[nm]) < 3.0, (src, nm, sent[nm] / 4.0)
+
+
+def test_event_mode_keeps_sending_while_trackers_are_frozen():
+    """포즈가 멈춰도 max_hold 로 계속 보낸다 — 클러치/그리퍼는 포즈와 무관하게 바뀐다."""
+    gate, sent = _drive_gate(500.0, {"left": 0.0, "right": 0.0}, event_mode=True, max_hold=0.02)
+    for nm in GATE_SIDES:
+        assert 40 <= sent[nm] / 4.0 <= 60, (nm, sent[nm] / 4.0)   # ~50Hz keepalive
+        assert gate.dup[nm] > 0                                    # 중복으로 정확히 계상
+
+
+def test_event_mode_counts_skips_when_polling_too_slow():
+    """폴링이 소스보다 느리면 조용히 버리지 않고 skipped 로 드러난다."""
+    gate, _ = _drive_gate(200.0, {"left": 125.0, "right": 246.0}, event_mode=True)
+    assert gate.skipped["right"] > 100, gate.skipped
+
+
 def test_tracking_loss_freeze():
     seq_tracker = SampleSeqTracker()
     res = [seq_tracker.update("X", (1.23, 4.56, 7.89), QUAT, 10.0 + i * 0.005)
@@ -78,5 +132,9 @@ if __name__ == "__main__":
     dup, sent = test_publisher_dedup(pt, psq)
     test_build_packet_wire()
     test_tracking_loss_freeze()
+    test_fixed_cadence_drops_the_faster_tracker()
+    test_event_mode_publishes_every_sample_exactly_once()
+    test_event_mode_keeps_sending_while_trackers_are_frozen()
+    test_event_mode_counts_skips_when_polling_too_slow()
     print(f"OK  oversampling dup={100 * dup / sent:.1f}%  (발행 {PUB_HZ:.0f}Hz / native {NATIVE_HZ:.0f}Hz)")
     print("ALL TESTS PASSED")
