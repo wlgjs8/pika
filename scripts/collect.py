@@ -637,6 +637,11 @@ class LivePreview:
     전달된다 -- 창에 포커스가 가면 터미널 'b' 가 안 먹는 문제의 보완.
     """
 
+    # realsense_color 는 "마지막으로 받은 1장"이라, 카메라가 중간에 죽어도 화면은 그대로
+    # 얼어붙는다(검게 변하지도 않는다). rs_ts 로 나이를 재서 그 경우를 드러낸다.
+    # 90Hz 수집에서 정상 나이는 20ms 미만이므로 0.5초면 오탐 없이 죽음만 잡힌다.
+    STALE_SEC = 0.5
+
     def __init__(self, names, bolt_colors, every=6, scale=1.0):
         # 프리뷰를 안 쓰는 헤드리스 수집이 cv2 유무에 묶이지 않도록 지연 임포트.
         global cv2, np
@@ -668,11 +673,19 @@ class LivePreview:
             return -1
         try:
             tiles = []
+            now = fr.get("ts") or time.time()
             order = sorted(range(len(self.names)), key=lambda i: 0 if self.names[i] == "left" else 1)
             for i in order:
-                img = fr["arms"][i].get("realsense_color")
+                arm = fr["arms"][i]
+                img = arm.get("realsense_color")
+                rs_ts = arm.get("rs_ts")
+                # 죽은 카메라를 "어두운 장면"으로 오해하지 않도록 사유를 화면에 박는다.
+                dead = None
                 if img is None:
                     img = np.zeros((480, 640, 3), np.uint8)
+                    dead = "NO FRAMES"
+                elif rs_ts and now - rs_ts > self.STALE_SEC:
+                    dead = f"STALE {now - rs_ts:.1f}s"
                 if self.scale != 1.0:
                     img = cv2.resize(img, None, fx=self.scale, fy=self.scale,
                                      interpolation=cv2.INTER_AREA)
@@ -680,6 +693,11 @@ class LivePreview:
                     img = img.copy()
                 cv2.putText(img, self.names[i].upper(), (8, 20), self._font, 0.55,
                             (185, 225, 185), 1, cv2.LINE_AA)
+                if dead:
+                    cv2.putText(img, dead, (8, img.shape[0] - 14), self._font, 0.8,
+                                (0, 0, 255), 2, cv2.LINE_AA)
+                    cv2.rectangle(img, (1, 1), (img.shape[1] - 2, img.shape[0] - 2),
+                                  (0, 0, 255), 3)
                 tiles.append(img)
             canvas = cv2.hconcat(tiles) if len(tiles) > 1 else tiles[0]
             bar = np.zeros((32, canvas.shape[1], 3), np.uint8)

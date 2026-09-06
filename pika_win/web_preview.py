@@ -19,6 +19,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+# 이보다 오래된 RealSense 프레임은 "얼어붙은 마지막 1장"으로 보고 타일에 표시한다.
+# 90Hz 수집에서 정상 나이는 20ms 미만이라 오탐 여지가 없다.
+STALE_FRAME_MS = 500.0
+
 _INDEX_HTML = """<!doctype html>
 <html lang="ko">
 <head>
@@ -212,11 +216,24 @@ def _encoder_loop(shared, hub, names, source_shape, tile_width, jpeg_quality):
             episode = int(shared["episode"].value)
             collect_hz = float(shared["collect_hz"].value)
             dropped = int(shared["dropped"].value)
+            arm_age_ms = list(shared["arm_age_ms"])
 
-        tiles = [
-            cv2.resize(local[i], (tile_width, tile_height), interpolation=cv2.INTER_AREA)
-            for i in order
-        ]
+        tiles = []
+        for i in order:
+            tile = cv2.resize(local[i], (tile_width, tile_height),
+                              interpolation=cv2.INTER_AREA)
+            age = arm_age_ms[i]
+            mark = None
+            if age < 0.0:
+                mark = "NO FRAMES"
+            elif age > STALE_FRAME_MS:
+                mark = f"STALE {age / 1000.0:.1f}s"
+            if mark:
+                cv2.putText(tile, mark, (6, tile_height - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, (0, 0, 255), 1, cv2.LINE_AA)
+                cv2.rectangle(tile, (1, 1), (tile_width - 2, tile_height - 2),
+                              (0, 0, 255), 2)
+            tiles.append(tile)
         canvas = cv2.hconcat(tiles) if len(tiles) > 1 else tiles[0]
         bar = np.zeros((34, canvas.shape[1], 3), dtype=np.uint8)
         state = "REC" if state_code == 2 else "IDLE"
@@ -329,7 +346,11 @@ class WebPreview:
             "collect_hz": ctx.RawValue(ctypes.c_double, 0.0),
             "published": ctx.RawValue(ctypes.c_ulonglong, 0),
             "dropped": ctx.RawValue(ctypes.c_ulonglong, 0),
+            # 팔별 마지막 RealSense 프레임 나이(ms). 음수 = 프레임 자체가 없음.
+            # 인코더가 이걸로 죽은 타일에 사유를 새긴다(검은 타일 = 어두운 장면 오인 방지).
+            "arm_age_ms": ctx.RawArray(ctypes.c_double, len(self.names)),
         }
+        self._shared["arm_age_ms"][:] = [-1.0] * len(self.names)
         recv_ready, send_ready = ctx.Pipe(duplex=False)
         self._ready = recv_ready
         self._process = ctx.Process(
@@ -400,12 +421,19 @@ class WebPreview:
                 self._shared["frames"], dtype=np.uint8
             ).reshape(self.source_shape)
             arms = frame.get("arms") or []
+            ages = self._shared["arm_age_ms"]
             for idx in range(len(self.names)):
-                image = arms[idx].get("realsense_color") if idx < len(arms) else None
+                arm = arms[idx] if idx < len(arms) else {}
+                image = arm.get("realsense_color")
                 if image is None or image.shape != self.source_shape[1:]:
                     target[idx].fill(0)
+                    ages[idx] = -1.0
                 else:
                     np.copyto(target[idx], image)
+                    rs_ts = arm.get("rs_ts")
+                    # rs_ts 를 안 주는 호출자(합성 프레임)는 나이를 알 수 없으니
+                    # 0(=신선)으로 두고 오탐을 내지 않는다.
+                    ages[idx] = (ts - float(rs_ts)) * 1000.0 if rs_ts else 0.0
             self._shared["capture_ts"].value = ts
             self._shared["sequence"].value += 1
             self._shared["published"].value += 1
